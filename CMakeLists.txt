@@ -22,11 +22,22 @@ FetchContent_Declare(csv-parser
 )
 FetchContent_MakeAvailable(csv-parser)
 
+FetchContent_Declare(Eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG        3.4.0
+)
+set(EIGEN_BUILD_DOC     OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(Eigen)
+
 # ── Library ───────────────────────────────────────────────────────────────────
-add_library(phylocore_core STATIC src/io.cxx)
+add_library(phylocore_core STATIC
+    src/io.cxx
+    src/models/gtr.cxx
+)
 
 target_include_directories(phylocore_core PUBLIC include)
-target_link_libraries(phylocore_core PUBLIC csv-parser)
+target_link_libraries(phylocore_core PUBLIC csv-parser Eigen3::Eigen)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
