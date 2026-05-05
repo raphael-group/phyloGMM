@@ -11,34 +11,35 @@
 namespace phylocore {
 
 /*!
- * @brief Optimize branch lengths via Expectation-Maximization.
+ * @brief Optimize model parameters via Expectation-Maximization.
  *
  * Each iteration:
- *   E-step — runs the inside-outside pass and calls model.e_step_branch()
- *            for every (node, character) pair to collect sufficient statistics.
- *   M-step — calls model.m_step_branch() for every node to update branch lengths,
- *            then clamps each length to [BRANCH_LENGTH_LB, BRANCH_LENGTH_UB].
+ *   E-step — runs the full inside-outside pass, then calls model.e_step() to
+ *            collect sufficient statistics. The format of suffstats is entirely
+ *            model-defined.
+ *   M-step — calls model.m_step(), which may update branch lengths, model
+ *            parameters, node_data, or any combination.
  *
  * Convergence is checked on total log-likelihood after each iteration.
  *
- * Models that do not override e_step_branch / m_step_branch return empty
- * suffstats / unchanged branch lengths, so this function degrades gracefully
- * to a no-op for such models (use optimize_branch_lengths instead).
+ * Models that do not override e_step / m_step leave all parameters unchanged
+ * and em_optimize returns immediately after one iteration; use
+ * optimize_branch_lengths() for those models instead.
  *
- * @param t         Tree whose branch lengths are optimized in place
- * @param model     Model providing e_step_branch and m_step_branch
- * @param node_data Per-node model data (may be updated by the model during E/M steps)
- * @param tol       Stop when log-likelihood improvement per iteration falls below this
- * @param max_iter  Maximum number of EM iterations
- * @return          Log-likelihood at the final branch lengths
+ * @param t         Tree (may be modified by m_step)
+ * @param model     Model providing e_step and m_step
+ * @param node_data Per-node model data (may be modified by e_step / m_step)
+ * @param tol       Stop when log-likelihood improvement falls below this
+ * @param max_iter  Maximum EM iterations
+ * @return          Log-likelihood at the final parameters
  */
 template <typename D>
-double em_optimize_branch_lengths(
-    tree&                    t,
-    phylogenetic_model<D>&   model,
-    std::vector<D>&          node_data,
-    double                   tol      = 1e-6,
-    int                      max_iter = 100)
+double em_optimize(
+    tree&                  t,
+    phylogenetic_model<D>& model,
+    std::vector<D>&        node_data,
+    double                 tol      = 1e-6,
+    int                    max_iter = 100)
 {
     size_t num_chars = model.alphabet_sizes.size();
     size_t max_alpha = *std::max_element(
@@ -58,25 +59,13 @@ double em_optimize_branch_lengths(
     double llh = total_llh();
 
     for (int iter = 0; iter < max_iter; ++iter) {
-        // E-step: full inside-outside pass
-        compute_inside_log_likelihood    (model, t, inside_ll,      node_data);
-        compute_edge_inside_log_likelihood(model, t, inside_ll, edge_inside_ll, node_data);
-        compute_outside_log_likelihood   (model, t, edge_inside_ll, outside_ll, node_data);
+        compute_inside_log_likelihood    (model, t, inside_ll,       node_data);
+        compute_edge_inside_log_likelihood(model, t, inside_ll,  edge_inside_ll, node_data);
+        compute_outside_log_likelihood   (model, t, edge_inside_ll, outside_ll,  node_data);
 
-        // Collect sufficient statistics and update each branch
-        for (size_t node_id = 0; node_id < t.num_nodes; ++node_id) {
-            std::vector<std::vector<double>> suffstats(num_chars);
-            for (size_t c = 0; c < num_chars; ++c) {
-                suffstats[c] = model.e_step_branch(
-                    node_data[node_id], node_id, c,
-                    inside_ll, outside_ll, edge_inside_ll);
-            }
-
-            double new_blen = model.m_step_branch(
-                node_id, suffstats, t.branch_lengths[node_id]);
-
-            t.branch_lengths[node_id] = std::clamp(new_blen, BRANCH_LENGTH_LB, BRANCH_LENGTH_UB);
-        }
+        std::vector<double> suffstats;
+        model.e_step(t, node_data, inside_ll, outside_ll, edge_inside_ll, suffstats);
+        model.m_step(t, node_data, suffstats);
 
         double new_llh = total_llh();
         if (new_llh - llh < tol) { llh = new_llh; break; }

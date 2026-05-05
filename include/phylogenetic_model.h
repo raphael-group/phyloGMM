@@ -5,14 +5,23 @@
 
 namespace phylocore {
 
-// Forward declaration — full definition is in phylogeny.h.
+// Forward declarations — full definitions are in phylogeny.h.
 // Avoids a circular dependency since phylogeny.h includes this header.
 class likelihood_buffer;
+struct tree;
 
 /*!
  * @brief Abstract base class for substitution models used in phylogenetic likelihood.
  *
- * @tparam D Model-specific per-node data type.
+ * To define a new model, inherit from this class with your per-node data type D
+ * and implement the four pure virtual methods. You then get likelihood computation,
+ * branch length optimization (Brent's), and topology search for free.
+ *
+ * To support EM-based parameter optimization, additionally override e_step and
+ * m_step. The M-step may update branch lengths, model parameters, or both.
+ *
+ * @tparam D Model-specific per-node data type. Use an empty struct for homogeneous
+ *           models where no per-node state is needed.
  */
 template <typename D>
 class phylogenetic_model {
@@ -21,6 +30,8 @@ public:
     std::vector<double> parameters;     // non-branch-length model parameters
 
     virtual ~phylogenetic_model() = default;
+
+    // ── Required interface ────────────────────────────────────────────────────
 
     /*!
      * @brief Computes log(P^c * v) for character c and branch length b,
@@ -66,42 +77,41 @@ public:
         std::vector<double>& result
     ) const = 0;
 
-    // ── EM branch length optimization (optional) ──────────────────────────────
+    // ── Optional EM interface ─────────────────────────────────────────────────
     //
-    // Models that support EM-based branch length optimization override both
-    // methods below. The default no-ops cause em_optimize_branch_lengths to
-    // leave branch lengths unchanged, so models that don't implement EM can
-    // still link against phylocore without issue.
+    // Override both methods to enable em_optimize(). The model owns the
+    // sufficient statistics format and decides what gets updated in the M-step
+    // — branch lengths, model parameters, or both.
+    //
+    // Default no-ops mean em_optimize() converges immediately for models that
+    // don't override these (use optimize_branch_lengths() instead).
 
     /*!
-     * @brief E-step: compute sufficient statistics for the branch leading into
-     *        node_id, for a single character.
+     * @brief E-step: compute sufficient statistics from the inside-outside pass.
      *
-     * Called once per node per character after the inside-outside pass. The
-     * returned vector is model-defined — pack whatever the M-step needs.
-     * Return an empty vector to signal that this node/character should be skipped.
+     * Called once per EM iteration after all three likelihood buffers are filled.
+     * Pack whatever the M-step needs into suffstats — the format is model-defined.
      */
-    virtual std::vector<double> e_step_branch(
-        D& data,
-        size_t node_id,
-        size_t character,
+    virtual void e_step(
+        tree& t,
+        std::vector<D>& node_data,
         const likelihood_buffer& inside_ll,
         const likelihood_buffer& outside_ll,
-        const likelihood_buffer& edge_inside_ll
-    ) const { return {}; }
+        const likelihood_buffer& edge_inside_ll,
+        std::vector<double>& suffstats
+    ) const {}
 
     /*!
-     * @brief M-step: given per-character sufficient statistics, return the
-     *        optimal branch length for node_id.
+     * @brief M-step: update parameters given sufficient statistics.
      *
-     * suffstats[c] is the vector returned by e_step_branch for character c.
-     * Return current_branch_length to leave the branch unchanged.
+     * May update t.branch_lengths, model parameters, node_data, or any
+     * combination. The model has full control.
      */
-    virtual double m_step_branch(
-        size_t node_id,
-        const std::vector<std::vector<double>>& suffstats,
-        double current_branch_length
-    ) const { return current_branch_length; }
+    virtual void m_step(
+        tree& t,
+        std::vector<D>& node_data,
+        const std::vector<double>& suffstats
+    ) {}
 };
 
 } // namespace phylocore
