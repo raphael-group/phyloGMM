@@ -36,19 +36,23 @@ add_library(phylocore_core STATIC
     src/models/gtr.cxx
 )
 
-target_include_directories(phylocore_core PUBLIC include)
-target_link_libraries(phylocore_core PUBLIC csv-parser Eigen3::Eigen)
+target_include_directories(phylocore_core PUBLIC include ${csv-parser_SOURCE_DIR}/include)
+target_link_libraries(phylocore_core PUBLIC Eigen3::Eigen)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
-add_executable(test_gtr src/test_gtr.cxx src/models/gtr.cxx)
-target_include_directories(test_gtr PRIVATE include)
-target_link_libraries(test_gtr PRIVATE Eigen3::Eigen)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/test_gtr.cxx)
+    add_executable(test_gtr src/test_gtr.cxx src/models/gtr.cxx)
+    target_include_directories(test_gtr PRIVATE include)
+    target_link_libraries(test_gtr PRIVATE Eigen3::Eigen)
+endif()
 
-add_executable(test_gtr_raxml tests/gtr_raxml/test_gtr_raxml.cxx src/models/gtr.cxx)
-target_include_directories(test_gtr_raxml PRIVATE include)
-target_link_libraries(test_gtr_raxml PRIVATE Eigen3::Eigen)
-# Run from project root: ./build/test_gtr_raxml [fixture_dir]
-# Generate fixtures first: python3 tests/gtr_raxml/generate_fixture.py
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gtr_raxml/test_gtr_raxml.cxx)
+    add_executable(test_gtr_raxml tests/gtr_raxml/test_gtr_raxml.cxx src/models/gtr.cxx)
+    target_include_directories(test_gtr_raxml PRIVATE include)
+    target_link_libraries(test_gtr_raxml PRIVATE Eigen3::Eigen)
+    # Run from project root: ./build/test_gtr_raxml [fixture_dir]
+    # Generate fixtures first: python3 tests/gtr_raxml/generate_fixture.py
+endif()
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
