@@ -23,7 +23,10 @@ FetchContent_Declare(csv-parser
 FetchContent_MakeAvailable(csv-parser)
 
 # ── Library ───────────────────────────────────────────────────────────────────
-add_subdirectory(src/)
+add_library(phylocore_core STATIC src/io.cxx)
+
+target_include_directories(phylocore_core PUBLIC include)
+target_link_libraries(phylocore_core PUBLIC csv-parser)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:

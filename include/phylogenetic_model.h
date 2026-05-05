@@ -5,6 +5,10 @@
 
 namespace phylocore {
 
+// Forward declaration — full definition is in phylogeny.h.
+// Avoids a circular dependency since phylogeny.h includes this header.
+class likelihood_buffer;
+
 /*!
  * @brief Abstract base class for substitution models used in phylogenetic likelihood.
  *
@@ -61,6 +65,43 @@ public:
         size_t character,
         std::vector<double>& result
     ) const = 0;
+
+    // ── EM branch length optimization (optional) ──────────────────────────────
+    //
+    // Models that support EM-based branch length optimization override both
+    // methods below. The default no-ops cause em_optimize_branch_lengths to
+    // leave branch lengths unchanged, so models that don't implement EM can
+    // still link against phylocore without issue.
+
+    /*!
+     * @brief E-step: compute sufficient statistics for the branch leading into
+     *        node_id, for a single character.
+     *
+     * Called once per node per character after the inside-outside pass. The
+     * returned vector is model-defined — pack whatever the M-step needs.
+     * Return an empty vector to signal that this node/character should be skipped.
+     */
+    virtual std::vector<double> e_step_branch(
+        D& data,
+        size_t node_id,
+        size_t character,
+        const likelihood_buffer& inside_ll,
+        const likelihood_buffer& outside_ll,
+        const likelihood_buffer& edge_inside_ll
+    ) const { return {}; }
+
+    /*!
+     * @brief M-step: given per-character sufficient statistics, return the
+     *        optimal branch length for node_id.
+     *
+     * suffstats[c] is the vector returned by e_step_branch for character c.
+     * Return current_branch_length to leave the branch unchanged.
+     */
+    virtual double m_step_branch(
+        size_t node_id,
+        const std::vector<std::vector<double>>& suffstats,
+        double current_branch_length
+    ) const { return current_branch_length; }
 };
 
 } // namespace phylocore

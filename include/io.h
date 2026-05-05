@@ -4,24 +4,10 @@
 #include <string>
 #include <vector>
 
-#include "digraph.h"
 #include "phylogeny.h"
+#include "phylogeny_data.h"
 
 namespace phylocore {
-
-/*!
- * @brief Core data container linking a character matrix to a set of trees.
- *
- * character_matrix[leaf_id][character] holds integer states (−1 = missing).
- * Downstream consumers (e.g. LAML-Pro) extend this struct to add
- * observation_matrix, mutation_priors, state_map, etc.
- */
-struct phylogeny_data {
-    size_t num_characters;
-    size_t max_alphabet_size;
-    std::vector<std::string>          taxa_names;
-    std::vector<std::vector<int>>     character_matrix; // [leaf_id][character]
-};
 
 /*!
  * @brief Parse a file containing one Newick string per non-empty line.
