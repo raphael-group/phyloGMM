@@ -39,6 +39,17 @@ add_library(phylocore_core STATIC
 target_include_directories(phylocore_core PUBLIC include)
 target_link_libraries(phylocore_core PUBLIC csv-parser Eigen3::Eigen)
 
+# ── Tests ─────────────────────────────────────────────────────────────────────
+add_executable(test_gtr src/test_gtr.cxx src/models/gtr.cxx)
+target_include_directories(test_gtr PRIVATE include)
+target_link_libraries(test_gtr PRIVATE Eigen3::Eigen)
+
+add_executable(test_gtr_raxml tests/gtr_raxml/test_gtr_raxml.cxx src/models/gtr.cxx)
+target_include_directories(test_gtr_raxml PRIVATE include)
+target_link_libraries(test_gtr_raxml PRIVATE Eigen3::Eigen)
+# Run from project root: ./build/test_gtr_raxml [fixture_dir]
+# Generate fixtures first: python3 tests/gtr_raxml/generate_fixture.py
+
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
 # find_package(pybind11 REQUIRED)
