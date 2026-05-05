@@ -46,12 +46,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/test_gtr.cxx)
     target_link_libraries(test_gtr PRIVATE Eigen3::Eigen)
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gtr_raxml/test_gtr_raxml.cxx)
-    add_executable(test_gtr_raxml tests/gtr_raxml/test_gtr_raxml.cxx src/models/gtr.cxx)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gtr_likelihood_raxml_validation/test_gtr_raxml.cxx)
+    add_executable(test_gtr_raxml tests/gtr_likelihood_raxml_validation/test_gtr_raxml.cxx src/models/gtr.cxx)
     target_include_directories(test_gtr_raxml PRIVATE include)
     target_link_libraries(test_gtr_raxml PRIVATE Eigen3::Eigen)
-    # Run from project root: ./build/test_gtr_raxml [fixture_dir]
-    # Generate fixtures first: python3 tests/gtr_raxml/generate_fixture.py
+    target_compile_definitions(test_gtr_raxml PRIVATE
+        PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    # Generate fixtures first: python3 tests/gtr_likelihood_raxml_validation/generate_fixture.py
 endif()
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
