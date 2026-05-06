@@ -20,6 +20,7 @@ FetchContent_Declare(csv-parser
     GIT_REPOSITORY https://github.com/vincentlaucsb/csv-parser.git
     GIT_TAG        master
 )
+set(CSV_CXX_STANDARD 17 CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(csv-parser)
 
 FetchContent_Declare(Eigen
@@ -34,6 +35,8 @@ FetchContent_MakeAvailable(Eigen)
 add_library(phylocore_core STATIC
     src/io.cxx
     src/models/gtr.cxx
+    src/models/phylo_gmm_model.cxx
+    src/models/laml.cxx
 )
 
 target_include_directories(phylocore_core PUBLIC include ${csv-parser_SOURCE_DIR}/include)
@@ -53,6 +56,34 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/gtr_likelihood_raxml_validation/test
     target_compile_definitions(test_gtr_raxml PRIVATE
         PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     # Generate fixtures first: python3 tests/gtr_likelihood_raxml_validation/generate_fixture.py
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/phylo_gmm/test_phylo_gmm.cxx)
+    add_executable(test_phylo_gmm
+        tests/phylo_gmm/test_phylo_gmm.cxx
+        src/models/gtr.cxx
+        src/models/phylo_gmm_model.cxx)
+    target_include_directories(test_phylo_gmm PRIVATE include)
+    target_link_libraries(test_phylo_gmm PRIVATE Eigen3::Eigen)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/laml/test_laml.cxx)
+    add_executable(test_laml
+        tests/laml/test_laml.cxx
+        src/models/laml.cxx)
+    target_include_directories(test_laml PRIVATE include)
+    target_link_libraries(test_laml PRIVATE Eigen3::Eigen)
+endif()
+
+# ── Driver: run phylo_gmm on a tree + observations CSV ───────────────────────
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/run_phylo_gmm.cxx)
+    add_executable(run_phylo_gmm
+        src/run_phylo_gmm.cxx
+        src/io.cxx
+        src/models/gtr.cxx
+        src/models/phylo_gmm_model.cxx)
+    target_include_directories(run_phylo_gmm PRIVATE include ${csv-parser_SOURCE_DIR}/include)
+    target_link_libraries(run_phylo_gmm PRIVATE Eigen3::Eigen csv)
 endif()
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
