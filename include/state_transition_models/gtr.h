@@ -1,82 +1,62 @@
-#ifndef PHYLOCORE_MODELS_GTR_H
-#define PHYLOCORE_MODELS_GTR_H
+#ifndef PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
+#define PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
 
 #include <vector>
 
 #include <Eigen/Dense>
 
-#include "../constants.h"
 #include "../state_transition_model.h"
 
 namespace phylocore {
 
-struct gtr_node_data {};
+struct gtr_node_data {};  // GTR has no per-node state
 
 /*!
- * @brief General Time Reversible (GTR) substitution model — k-state reversible CTMC.
+ * @brief General Time Reversible (GTR) substitution model.
  *
- * Each character has its own rate matrix parameterized by:
+ * Set rates[c], freqs[c] per site, then call build() to:
+ *   - compute the eigendecomposition cache per site
+ *   - populate sites_latent_states with each site's alphabet_size
+ *   - set root_prior = freqs (stationary distribution at root)
+ *   - sync state_transition_parameters = [rates[0], freqs[0], rates[1], freqs[1], ...]
+ *
+ * Only the mandatory scalar primitive compute_log_transition_probability
+ * is overridden. has_optimized_functions stays false; the traversal uses the
+ * k²-scalar fallback. Pair with identity_observation_model<gtr_node_data>
+ * and observed_data of type vector<vector<int>>.
+ *
+ * Per-site parameterization:
  *   - rates[c]: k*(k-1)/2 exchangeability rates (upper triangle of symmetric S,
  *               row-major: (0,1), (0,2), ..., (0,k-1), (1,2), ..., (k-2,k-1))
- *   - freqs[c]: k stationary frequencies summing to 1
- *
- * Usage:
- *   1. Set sites_latent_states, rates, freqs, character_matrix
- *   2. Call build() to compute eigendecompositions and normalize Q
- *   3. Pass to compute_inside_log_likelihood, optimize_branch_lengths, etc.
+ *   - freqs[c]: k stationary frequencies, must sum to 1
  *
  * To update parameters after construction, modify rates/freqs and call build() again.
  */
 class gtr_model : public state_transition_model<gtr_node_data> {
 public:
-    std::vector<std::vector<double>> rates;            // [character][k*(k-1)/2]
-    std::vector<std::vector<double>> freqs;            // [character][k], must sum to 1
-    std::vector<std::vector<int>>    character_matrix; // [leaf_id][character], -1 = missing
+    std::vector<std::vector<double>> rates;  // [site][k*(k-1)/2]
+    std::vector<std::vector<double>> freqs;  // [site][k], must sum to 1
 
-    /*!
-     * @brief Build eigendecompositions from rates and freqs.
-     *
-     * Sets sites_latent_states[c].alphabet_size from freqs[c].size(). Normalizes each Q so that the
-     * expected number of substitutions per unit time equals 1. Syncs rates and
-     * freqs into the inherited flat parameters vector.
-     */
     void build();
 
-    void compute_log_pmatrix_vector_product(
+    double compute_log_transition_probability(
         gtr_node_data& data,
-        size_t character,
-        double branch_length,
-        const std::vector<double>& log_vector,
-        std::vector<double>& result) const override;
-
-    void compute_log_pmatrix_transpose_vector_product(
-        gtr_node_data& data,
-        size_t character,
-        double branch_length,
-        const std::vector<double>& log_vector,
-        std::vector<double>& result) const override;
+        size_t         site,
+        double         branch_length,
+        size_t         alpha,
+        size_t         beta
+    ) const override;
 
 private:
-    struct character_cache {
-        Eigen::MatrixXd U;           // eigenvectors (columns), k×k
-        Eigen::VectorXd lambda;      // eigenvalues (ascending, all ≤ 0)
-        Eigen::VectorXd sqrt_pi;     // sqrt of stationary frequencies
-        Eigen::VectorXd inv_sqrt_pi; // 1 / sqrt of stationary frequencies
+    struct site_cache {
+        Eigen::MatrixXd U;            // eigenvectors of symmetric similarity transform
+        Eigen::VectorXd lambda;       // eigenvalues
+        Eigen::VectorXd sqrt_pi;
+        Eigen::VectorXd inv_sqrt_pi;
     };
-
-    std::vector<character_cache> cache; // one per character, filled by build()
-
-    // P(t) * exp(log_v) in linear space, using precomputed eigendecomposition
-    Eigen::VectorXd apply_pmatrix(
-        const character_cache& ch, double blen,
-        const std::vector<double>& log_v) const;
-
-    // P(t)^T * exp(log_v) in linear space
-    Eigen::VectorXd apply_pmatrix_transpose(
-        const character_cache& ch, double blen,
-        const std::vector<double>& log_v) const;
+    std::vector<site_cache> cache;  // one per site, filled by build()
 };
 
 } // namespace phylocore
 
-#endif // PHYLOCORE_MODELS_GTR_H
+#endif // PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
