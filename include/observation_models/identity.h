@@ -1,6 +1,7 @@
 #ifndef PHYLOCORE_OBSERVATION_MODELS_IDENTITY_H
 #define PHYLOCORE_OBSERVATION_MODELS_IDENTITY_H
 
+#include <variant>
 #include <vector>
 
 #include "../constants.h"
@@ -18,7 +19,7 @@ namespace phylocore {
  * Templated on D so it can pair with any state_transition_model<D>. D is
  * unused inside the body — emission is independent of per-node state.
  */
-template <typename D>
+template <typename D = std::monostate>
 class identity_observation_model : public observation_model<D, std::vector<int>> {
 public:
     double compute_log_emission_probability(

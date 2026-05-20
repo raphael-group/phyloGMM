@@ -59,6 +59,19 @@ process_input_result<O> process_input_data(
     const std::string& observations_file
 );
 
+/*!
+ * @brief Explicit specialization for per-site discrete integer observations.
+ *
+ * Parses observations_file as a CSV character matrix (rows = taxa, columns =
+ * sites). Defined in io.cxx.
+ */
+template <>
+process_input_result<std::vector<int>>
+process_input_data<std::vector<int>>(
+    std::vector<tree>& trees,
+    const std::string& observations_file
+);
+
 } // namespace phylocore
 
 #endif // PHYLOCORE_IO_H

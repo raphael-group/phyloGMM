@@ -1,6 +1,7 @@
 #ifndef PHYLOCORE_OBSERVATION_MODEL_H
 #define PHYLOCORE_OBSERVATION_MODEL_H
 
+#include <variant>
 #include <vector>
 
 namespace phylocore {
@@ -17,7 +18,7 @@ namespace phylocore {
  *           (per-site states for one leaf). For continuous models, e.g.
  *           Eigen::VectorXd (one d-dim vector per leaf).
  */
-template <typename D, typename O>
+template <typename D = std::monostate, typename O = std::vector<int>>
 class observation_model {
 public:
     std::vector<double> observation_parameters;

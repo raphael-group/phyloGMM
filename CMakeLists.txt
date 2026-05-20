@@ -42,6 +42,10 @@ add_library(phylocore_core STATIC
 target_include_directories(phylocore_core PUBLIC include ${csv-parser_SOURCE_DIR}/include)
 target_link_libraries(phylocore_core PUBLIC Eigen3::Eigen)
 
+# ── Driver: run_gtr ──────────────────────────────────────────────────────────
+add_executable(run_gtr src/run_gtr.cxx)
+target_link_libraries(run_gtr PRIVATE phylocore_core csv)
+
 # ── Tests / drivers (disabled until consumer fixes land) ─────────────────────
 # test_gtr, test_gtr_raxml, test_phylo_gmm, test_laml, run_phylo_gmm all need
 # to be updated for the new observation_model<D, O> + observed_data flow.

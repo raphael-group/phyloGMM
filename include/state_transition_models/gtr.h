@@ -1,6 +1,7 @@
 #ifndef PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
 #define PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
 
+#include <variant>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -9,10 +10,10 @@
 
 namespace phylocore {
 
-struct gtr_node_data {};  // GTR has no per-node state
-
 /*!
  * @brief General Time Reversible (GTR) substitution model.
+ *
+ * Uses the default D = std::monostate (no per-node state).
  *
  * Set rates[c], freqs[c] per site, then call build() to:
  *   - compute the eigendecomposition cache per site
@@ -22,8 +23,8 @@ struct gtr_node_data {};  // GTR has no per-node state
  *
  * Only the mandatory scalar primitive compute_log_transition_probability
  * is overridden. has_optimized_functions stays false; the traversal uses the
- * k²-scalar fallback. Pair with identity_observation_model<gtr_node_data>
- * and observed_data of type vector<vector<int>>.
+ * k²-scalar fallback. Pair with identity_observation_model<> and observed_data
+ * of type vector<vector<int>>.
  *
  * Per-site parameterization:
  *   - rates[c]: k*(k-1)/2 exchangeability rates (upper triangle of symmetric S,
@@ -32,7 +33,7 @@ struct gtr_node_data {};  // GTR has no per-node state
  *
  * To update parameters after construction, modify rates/freqs and call build() again.
  */
-class gtr_model : public state_transition_model<gtr_node_data> {
+class gtr_model : public state_transition_model<> {
 public:
     std::vector<std::vector<double>> rates;  // [site][k*(k-1)/2]
     std::vector<std::vector<double>> freqs;  // [site][k], must sum to 1
@@ -40,11 +41,11 @@ public:
     void build();
 
     double compute_log_transition_probability(
-        gtr_node_data& data,
-        size_t         site,
-        double         branch_length,
-        size_t         alpha,
-        size_t         beta
+        std::monostate& data,
+        size_t          site,
+        double          branch_length,
+        size_t          alpha,
+        size_t          beta
     ) const override;
 
 private:

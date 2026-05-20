@@ -3,6 +3,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "state_space.h"
@@ -33,7 +34,7 @@ struct tree;
  * @tparam D Model-specific per-node data type. Use an empty struct for homogeneous
  *           models where no per-node state is needed.
  */
-template <typename D>
+template <typename D = std::monostate>
 class state_transition_model {
 public:
     std::vector<state_space>          sites_latent_states; // one state_space per site
