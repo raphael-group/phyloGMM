@@ -1,5 +1,6 @@
 #include "io.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <functional>
@@ -111,15 +112,17 @@ parse_character_matrix(const std::string& filename) {
     return {taxa_names, matrix};
 }
 
-// ─── process_phylogeny_data ──────────────────────────────────────────────────
+// ─── process_input_data ──────────────────────────────────────────────────────
 
-phylogeny_data process_phylogeny_data(
+template <>
+process_input_result<std::vector<int>>
+process_input_data<std::vector<int>>(
     std::vector<tree>& trees,
-    const std::string& character_matrix_file)
+    const std::string& observations_file)
 {
-    if (trees.empty()) throw std::runtime_error("process_phylogeny_data: no trees provided");
+    if (trees.empty()) throw std::runtime_error("process_input_data: no trees provided");
 
-    auto [file_taxa_names, raw_matrix] = parse_character_matrix(character_matrix_file);
+    auto [file_taxa_names, raw_matrix] = parse_character_matrix(observations_file);
 
     // Map file taxa name → row index
     std::unordered_map<std::string, size_t> file_taxa_idx;
@@ -140,21 +143,21 @@ phylogeny_data process_phylogeny_data(
         }
     }
 
-    size_t total_leaves   = leaf_global_order.size();
-    size_t num_characters = raw_matrix.empty() ? 0 : raw_matrix[0].size();
+    size_t total_leaves = leaf_global_order.size();
+    size_t num_sites    = raw_matrix.empty() ? 0 : raw_matrix[0].size();
 
-    // Build aligned global matrix; assign leaf node.data
-    std::vector<std::vector<int>> global_matrix(total_leaves,
-                                                 std::vector<int>(num_characters, -1));
-    std::vector<std::string> global_taxa_names(total_leaves);
+    // Build aligned per-leaf observation rows; assign leaf node.data
+    std::vector<std::vector<int>> observed_data(total_leaves,
+                                                std::vector<int>(num_sites, -1));
+    std::vector<std::string> taxa_names(total_leaves);
 
     for (size_t i = 0; i < total_leaves; ++i) {
         auto [k, node_id] = leaf_global_order[i];
         const std::string& name = trees[k].node_names[node_id];
         if (!file_taxa_idx.count(name))
-            throw std::runtime_error("Leaf '" + name + "' not found in character matrix");
-        global_taxa_names[i] = name;
-        global_matrix[i]     = raw_matrix[file_taxa_idx.at(name)];
+            throw std::runtime_error("Leaf '" + name + "' not found in observations file");
+        taxa_names[i]    = name;
+        observed_data[i] = raw_matrix[file_taxa_idx.at(name)];
         trees[k].tree[node_id].data = i;
     }
 
@@ -165,17 +168,24 @@ phylogeny_data process_phylogeny_data(
             if (t.tree.out_degree(node_id) != 0)
                 t.tree[node_id].data = internal_counter++;
 
-    // Compute max_alphabet_size from observed states
-    int max_state = 0;
-    for (const auto& row : global_matrix)
-        for (int s : row)
-            if (s > max_state) max_state = s;
+    // Per-site alphabet sizes: max observed state + 1, floored at 1.
+    std::vector<size_t> alphabet_sizes(num_sites, 1);
+    for (const auto& row : observed_data)
+        for (size_t j = 0; j < num_sites; ++j)
+            if (row[j] >= 0 && static_cast<size_t>(row[j]) + 1 > alphabet_sizes[j])
+                alphabet_sizes[j] = static_cast<size_t>(row[j]) + 1;
 
-    return {
-        num_characters,
-        static_cast<size_t>(max_state + 1),
-        global_taxa_names,
-        global_matrix
+    size_t max_alphabet_size = *std::max_element(
+        alphabet_sizes.begin(), alphabet_sizes.end());
+
+    return process_input_result<std::vector<int>>{
+        std::move(observed_data),
+        meta_data{
+            num_sites,
+            max_alphabet_size,
+            std::move(alphabet_sizes),
+            std::move(taxa_names)
+        }
     };
 }
 
