@@ -47,8 +47,17 @@ add_executable(run_gtr src/run_gtr.cxx)
 target_link_libraries(run_gtr PRIVATE phylocore_core csv)
 
 # ── Tests / drivers (disabled until consumer fixes land) ─────────────────────
-# test_gtr, test_gtr_raxml, test_phylo_gmm, test_laml, run_phylo_gmm all need
+# test_gtr, test_phylo_gmm, test_laml, run_phylo_gmm all need
 # to be updated for the new observation_model<D, O> + observed_data flow.
+
+# ── Test: GTR vs RAxML-NG reference ──────────────────────────────────────────
+add_executable(test_gtr_raxml
+    tests/gtr_likelihood_raxml_validation/test_gtr_raxml.cxx
+)
+target_link_libraries(test_gtr_raxml PRIVATE phylocore_core csv)
+target_compile_definitions(test_gtr_raxml
+    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
