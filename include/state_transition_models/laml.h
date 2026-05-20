@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "../phylogenetic_model.h"
+#include "../state_transition_model.h"
 
 namespace phylocore {
 
@@ -49,7 +49,7 @@ struct laml_data {
  *   2. Call initialize_data() to build per-node caches from the tree.
  *   3. Pass the model and node_data to the standard phylocore likelihood traversals.
  */
-class laml_model : public phylogenetic_model<laml_data> {
+class laml_model : public state_transition_model<laml_data> {
 public:
     std::vector<std::vector<int>>                  character_matrix;   // [leaf_id][character]
     std::vector<std::vector<std::vector<double>>>  observation_matrix; // [leaf_id][character][state]
@@ -79,15 +79,6 @@ public:
     void compute_log_pmatrix_transpose_vector_product(
         laml_data& d, size_t character, double branch_length,
         const std::vector<double>& log_vector, std::vector<double>& result
-    ) const override;
-
-    void compute_taxa_log_inside_likelihood(
-        laml_data& d, size_t character, size_t taxa_id,
-        std::vector<double>& result
-    ) const override;
-
-    void compute_root_distribution(
-        laml_data& d, size_t character, std::vector<double>& result
     ) const override;
 
     /*!

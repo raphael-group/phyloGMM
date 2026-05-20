@@ -6,7 +6,7 @@
 #include <Eigen/Dense>
 
 #include "../constants.h"
-#include "../phylogenetic_model.h"
+#include "../state_transition_model.h"
 
 namespace phylocore {
 
@@ -21,13 +21,13 @@ struct gtr_node_data {};
  *   - freqs[c]: k stationary frequencies summing to 1
  *
  * Usage:
- *   1. Set alphabet_sizes, rates, freqs, character_matrix
+ *   1. Set sites_latent_states, rates, freqs, character_matrix
  *   2. Call build() to compute eigendecompositions and normalize Q
  *   3. Pass to compute_inside_log_likelihood, optimize_branch_lengths, etc.
  *
  * To update parameters after construction, modify rates/freqs and call build() again.
  */
-class gtr_model : public phylogenetic_model<gtr_node_data> {
+class gtr_model : public state_transition_model<gtr_node_data> {
 public:
     std::vector<std::vector<double>> rates;            // [character][k*(k-1)/2]
     std::vector<std::vector<double>> freqs;            // [character][k], must sum to 1
@@ -36,7 +36,7 @@ public:
     /*!
      * @brief Build eigendecompositions from rates and freqs.
      *
-     * Sets alphabet_sizes from freqs[c].size(). Normalizes each Q so that the
+     * Sets sites_latent_states[c].alphabet_size from freqs[c].size(). Normalizes each Q so that the
      * expected number of substitutions per unit time equals 1. Syncs rates and
      * freqs into the inherited flat parameters vector.
      */
@@ -54,17 +54,6 @@ public:
         size_t character,
         double branch_length,
         const std::vector<double>& log_vector,
-        std::vector<double>& result) const override;
-
-    void compute_taxa_log_inside_likelihood(
-        gtr_node_data& data,
-        size_t character,
-        size_t taxa_id,
-        std::vector<double>& result) const override;
-
-    void compute_root_distribution(
-        gtr_node_data& data,
-        size_t character,
         std::vector<double>& result) const override;
 
 private:

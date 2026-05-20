@@ -6,7 +6,7 @@
 
 #include <Eigen/Dense>
 
-#include "../phylogenetic_model.h"
+#include "../state_transition_model.h"
 
 namespace phylocore {
 
@@ -33,7 +33,7 @@ struct phylo_gmm_node_data {};
  *
  * After each M-step, build() is called automatically to refresh the cache.
  */
-class phylo_gmm_model : public phylogenetic_model<phylo_gmm_node_data> {
+class phylo_gmm_model : public state_transition_model<phylo_gmm_node_data> {
 public:
     // ── Model parameters ──────────────────────────────────────────────────────
 
@@ -92,11 +92,11 @@ public:
      * @brief Compute and cache the eigendecomposition of Q.
      *
      * Must be called after construction and after any direct modification of Q.
-     * Called automatically by m_step(). Sets alphabet_sizes = {k}.
+     * Called automatically by m_step(). Sets sites_latent_states to a single-element {{k, {}, 0}}.
      */
     void build();
 
-    // ── Required phylogenetic_model interface ─────────────────────────────────
+    // ── Required state_transition_model interface ────────────────────────────
 
     void compute_log_pmatrix_vector_product(
         phylo_gmm_node_data& data,
@@ -110,17 +110,6 @@ public:
         size_t character,
         double branch_length,
         const std::vector<double>& log_vector,
-        std::vector<double>& result) const override;
-
-    void compute_taxa_log_inside_likelihood(
-        phylo_gmm_node_data& data,
-        size_t character,
-        size_t taxa_id,
-        std::vector<double>& result) const override;
-
-    void compute_root_distribution(
-        phylo_gmm_node_data& data,
-        size_t character,
         std::vector<double>& result) const override;
 
     // ── EM interface ──────────────────────────────────────────────────────────
