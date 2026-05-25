@@ -1,5 +1,5 @@
-#ifndef PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
-#define PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
+#ifndef PHYLOCORE_STATE_TRANSITION_MODELS_REVERSIBLE_CTMC_H
+#define PHYLOCORE_STATE_TRANSITION_MODELS_REVERSIBLE_CTMC_H
 
 #include <variant>
 #include <vector>
@@ -11,7 +11,12 @@
 namespace phylocore {
 
 /*!
- * @brief General Time Reversible (GTR) substitution model.
+ * @brief Reversible CTMC substitution model (the GTR parameterization).
+ *
+ * Q is constructed from a symmetric exchangeability matrix S and stationary
+ * frequencies π via Q = S · diag(π); detailed balance holds by construction,
+ * so eigenvalues are real and A = diag(√π)·Q·diag(1/√π) is symmetric.
+ * Eigendecomposition uses Eigen::SelfAdjointEigenSolver for numerical stability.
  *
  * Uses the default D = std::monostate (no per-node state).
  *
@@ -33,7 +38,7 @@ namespace phylocore {
  *
  * To update parameters after construction, modify rates/freqs and call build() again.
  */
-class gtr_model : public state_transition_model<> {
+class reversible_ctmc_model : public state_transition_model<> {
 public:
     std::vector<std::vector<double>> rates;  // [site][k*(k-1)/2]
     std::vector<std::vector<double>> freqs;  // [site][k], must sum to 1
@@ -60,4 +65,4 @@ private:
 
 } // namespace phylocore
 
-#endif // PHYLOCORE_STATE_TRANSITION_MODELS_GTR_H
+#endif // PHYLOCORE_STATE_TRANSITION_MODELS_REVERSIBLE_CTMC_H

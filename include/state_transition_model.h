@@ -28,8 +28,9 @@ struct tree;
  * has_optimized_functions = true so the traversal uses them instead of looping
  * over the scalar primitive.
  *
- * To support EM-based parameter optimization, additionally override e_step and
- * m_step. The M-step may update branch lengths, model parameters, or both.
+ * Parameter estimation (EM, branch optimization, etc.) lives separately under
+ * `include/parameter_estimation/` as free-function overloads, not virtuals on
+ * this base. See docs/parameter_estimation.md.
  *
  * @tparam D Model-specific per-node data type. Use an empty struct for homogeneous
  *           models where no per-node state is needed.
@@ -135,17 +136,6 @@ public:
         std::vector<double>& suffstats
     ) const {}
 
-    /*!
-     * @brief M-step: update parameters given sufficient statistics.
-     *
-     * May update t.branch_lengths, model parameters, node_data, or any
-     * combination. The model has full control.
-     */
-    virtual void m_step(
-        tree& t,
-        std::vector<D>& node_data,
-        const std::vector<double>& suffstats
-    ) {}
 };
 
 } // namespace phylocore

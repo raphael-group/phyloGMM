@@ -1,4 +1,4 @@
-#include "state_transition_models/gtr.h"
+#include "state_transition_models/reversible_ctmc.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -10,7 +10,7 @@ namespace phylocore {
 
 // ── build ─────────────────────────────────────────────────────────────────────
 
-void gtr_model::build() {
+void reversible_ctmc_model::build() {
     size_t num_sites = freqs.size();
     sites_latent_states.resize(num_sites);
     cache.resize(num_sites);
@@ -39,7 +39,7 @@ void gtr_model::build() {
         double mu = -(pi.transpose() * Q.diagonal()).value();
         if (mu <= 0.0)
             throw std::runtime_error(
-                "gtr_model: zero total rate at site " + std::to_string(c));
+                "reversible_ctmc_model: zero total rate at site " + std::to_string(c));
         Q /= mu;
 
         // Symmetric similarity transform: A = diag(√π) · Q · diag(1/√π)
@@ -51,7 +51,7 @@ void gtr_model::build() {
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(A);
         if (solver.info() != Eigen::Success)
             throw std::runtime_error(
-                "gtr_model: eigendecomp failed at site " + std::to_string(c));
+                "reversible_ctmc_model: eigendecomp failed at site " + std::to_string(c));
 
         cache[c] = { solver.eigenvectors(), solver.eigenvalues(),
                      sqrt_pi, inv_sqrt_pi };
@@ -78,7 +78,7 @@ void gtr_model::build() {
 //
 // (using Uᵀ[p, β] = U[β, p], which holds because A is symmetric → U is orthogonal.)
 
-double gtr_model::compute_log_transition_probability(
+double reversible_ctmc_model::compute_log_transition_probability(
     std::monostate&,
     size_t c,
     double branch_length,

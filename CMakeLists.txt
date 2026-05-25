@@ -34,8 +34,9 @@ FetchContent_MakeAvailable(Eigen)
 # ── Library ───────────────────────────────────────────────────────────────────
 add_library(phylocore_core STATIC
     src/io.cxx
-    src/state_transition_models/gtr.cxx
-    # src/state_transition_models/phylo_gmm_model.cxx  # disabled: pending migration (Task #9)
+    src/state_transition_models/reversible_ctmc.cxx
+    src/state_transition_models/ctmc.cxx
+    src/observation_models/gmm.cxx
     # src/state_transition_models/laml.cxx              # disabled: pending migration (Task #9)
 )
 
