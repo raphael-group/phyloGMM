@@ -4,6 +4,8 @@
 #include <variant>
 #include <vector>
 
+#include "state_space.h"
+
 namespace phylocore {
 
 /*!
@@ -21,7 +23,12 @@ namespace phylocore {
 template <typename D = std::monostate, typename O = std::vector<int>>
 class observation_model {
 public:
-    std::vector<double> observation_parameters;
+    // Mirror of state_transition_model::sites_latent_states. Caller sets this
+    // in sync with the paired state_transition_model (after stm.build()). Lets
+    // the obs_model know what `alpha` ranges over per site without holding a
+    // reference to the state_transition_model.
+    std::vector<state_space> sites_latent_states;
+    std::vector<double>      observation_parameters;
 
     virtual ~observation_model() = default;
 
