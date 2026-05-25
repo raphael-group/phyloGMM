@@ -8,6 +8,7 @@
 #include "constants.h"
 #include "digraph.h"
 #include "math_utilities.h"
+#include "meta_data.h"
 #include "observation_model.h"
 #include "state_transition_model.h"
 
@@ -102,10 +103,12 @@ std::vector<double> compute_inside_log_likelihood(
     const state_transition_model<D>&  state_transition_model,
     const observation_model<D, O>&    obs_model,
     const std::vector<O>&             observed_data,
+    const meta_data&                  metadata,
     const tree& t,
     likelihood_buffer& b,
     std::vector<D>& node_data
 ) {
+    (void)metadata; // currently unused inside the traversal; threaded through for downstream consumers
     size_t num_sites = state_transition_model.sites_latent_states.size();
     size_t max_alpha = std::max_element(
         state_transition_model.sites_latent_states.begin(),
