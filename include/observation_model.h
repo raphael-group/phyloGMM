@@ -28,6 +28,14 @@ public:
     // the obs_model know what `alpha` ranges over per site without holding a
     // reference to the state_transition_model.
     std::vector<state_space> sites_latent_states;
+
+    // Per-site description of the observed state space. For discrete emissions
+    // each entry is a state_space with is_continuous = false and its own
+    // alphabet (e.g. nucleotides). For continuous emissions (Gaussian per
+    // leaf), set is_continuous = true and dimension = d. Populated by the
+    // concrete obs_model (typically in its build() / constructor).
+    std::vector<state_space> sites_observation_states;
+
     std::vector<double>      observation_parameters;
 
     virtual ~observation_model() = default;
