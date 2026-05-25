@@ -112,30 +112,6 @@ public:
         bool transpose
     ) const {}
 
-    // ── Optional EM interface ─────────────────────────────────────────────────
-    //
-    // Override both methods to enable em_optimize(). The model owns the
-    // sufficient statistics format and decides what gets updated in the M-step
-    // — branch lengths, model parameters, or both.
-    //
-    // Default no-ops mean em_optimize() converges immediately for models that
-    // don't override these (use optimize_branch_lengths() instead).
-
-    /*!
-     * @brief E-step: compute sufficient statistics from the inside-outside pass.
-     *
-     * Called once per EM iteration after all three likelihood buffers are filled.
-     * Pack whatever the M-step needs into suffstats — the format is model-defined.
-     */
-    virtual void e_step(
-        tree& t,
-        std::vector<D>& node_data,
-        const likelihood_buffer& inside_ll,
-        const likelihood_buffer& outside_ll,
-        const likelihood_buffer& edge_inside_ll,
-        std::vector<double>& suffstats
-    ) const {}
-
 };
 
 } // namespace phylocore

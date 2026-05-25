@@ -69,12 +69,10 @@ double em_optimize(
         compute_edge_inside_log_likelihood(state_transition_model, t, inside_ll,  edge_inside_ll, node_data);
         compute_outside_log_likelihood   (state_transition_model, t, edge_inside_ll, outside_ll,  node_data);
 
-        // DEPRECATED: m_step has been removed from state_transition_model.
-        // This file is slated for replacement by parameter_estimation/em.h.
-        // The loop below still calls e_step but no longer updates parameters.
-        std::vector<double> suffstats;
-        state_transition_model.e_step(t, node_data, inside_ll, outside_ll, edge_inside_ll, suffstats);
-        // (m_step call removed; see docs/parameter_estimation.md)
+        // DEPRECATED: both e_step and m_step have been removed from
+        // state_transition_model. This file is slated for replacement by
+        // parameter_estimation/em.h. The loop below no longer updates any
+        // parameters.
 
         double new_llh = total_llh();
         if (new_llh - llh < tol) { llh = new_llh; break; }
