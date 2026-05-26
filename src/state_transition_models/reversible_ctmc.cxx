@@ -53,8 +53,16 @@ void reversible_ctmc_model::build() {
             throw std::runtime_error(
                 "reversible_ctmc_model: eigendecomp failed at site " + std::to_string(c));
 
-        cache[c] = { solver.eigenvectors(), solver.eigenvalues(),
-                     sqrt_pi, inv_sqrt_pi };
+        Eigen::MatrixXd U_A     = solver.eigenvectors();
+        Eigen::VectorXd lambda  = solver.eigenvalues();
+
+        // Eigendecomposition of Q itself (real for reversible models):
+        //   U_Q    = diag(1/√π) · U_A
+        //   U_Q⁻¹ = U_Aᵀ · diag(√π)
+        Eigen::MatrixXd U_Q     = inv_sqrt_pi.asDiagonal() * U_A;
+        Eigen::MatrixXd U_Q_inv = U_A.transpose() * sqrt_pi.asDiagonal();
+
+        cache[c] = { U_A, lambda, sqrt_pi, inv_sqrt_pi, U_Q, U_Q_inv };
     }
 
     // Sync flat parameters: [rates[0], freqs[0], rates[1], freqs[1], ...]

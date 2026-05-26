@@ -2,7 +2,7 @@
 #define PHYLOCORE_OPTIMIZE_HOBOLTH_JENSEN_H
 
 // Header-only Hobolth-Jensen expected-sufficient-statistics helper for a
-// reversible CTMC on a (rooted) tree. No IPOPT dependency.
+// general CTMC on a (rooted) tree. No IPOPT dependency.
 //
 // For each edge e = (parent w → child u) with branch length t_e, the helper
 // computes the expected number of substitutions E[N_ij | y]_e from state i to
@@ -11,7 +11,7 @@
 // CTMC conditional on the observation y. It then sums these contributions
 // across (1) every edge of every tree in problem.trees and (2) every site
 // — yielding two aggregate suff-stat tensors suitable for the closed-form
-// reversible GTR M-step.
+// CTMC M-step.
 //
 // Math reference: Hobolth & Jensen, "Statistical inference in evolutionary
 // models of DNA sequences via the EM algorithm" (Stat. Appl. Genet. Mol.
@@ -23,27 +23,36 @@
 // (sinhc(x) = sinh(x)/x, sinhc(0) = 1), which is numerically stable as
 // λ_p → λ_q.
 //
-// Because reversible_ctmc_model caches the eigendecomposition of the
-// SYMMETRIC matrix A = diag(√π)·Q·diag(1/√π) (A = U·diag(λ)·Uᵀ with U
-// orthogonal and λ real), we can run the entire computation in real
-// arithmetic. With U_Q  = diag(1/√π) · U and U_Q⁻¹ = Uᵀ · diag(√π):
+// This helper is templated on the scalar type deduced from the model's
+// eigendecomposition of Q (real for reversible_ctmc_model, complex for the
+// general ctmc_model). With Q = U_Q · diag(λ_Q) · U_Q⁻¹:
 //
 //   W_e[a,b] = exp(outside(parent, a) + sibling_edge_inside(a)
 //                 + inside(child, b) − log p(y))
 //   G_e      = U_Qᵀ · W_e · (U_Q⁻¹)ᵀ
-//            = Uᵀ · ( diag(1/√π) · W_e · diag(√π) ) · U          (real)
 //   H        = Σ_e  G_e ⊙ J_e          where J_e[p,q] = J_{pq}(t_e)
 //   C        = (U_Q⁻¹)ᵀ · H · U_Qᵀ
-//            = diag(√π) · U · H · Uᵀ · diag(1/√π)               (real)
 //
 //   E[T_i  | y]_e  = C[i, i]
 //   E[N_ij | y]_e  = Q_ij · C[i, j]    (i ≠ j)
 //
-// The helper sums these aggregates across edges, trees, and sites.
+// For reversible models the symmetric similarity transform A = D·Q·D⁻¹ has
+// orthogonal eigenvectors U_A, and U_Q = D⁻¹·U_A, U_Q⁻¹ = U_Aᵀ·D, λ_Q = λ_A,
+// all real. The helper consumes these uniformly via the model's
+// eigenvectors_q / eigenvalues_q / inverse_eigenvectors_q accessors.
+//
+// Model API contract (duck-typed via eigendecomp accessors):
+//   stm.eigenvectors_q(site_c)         -> const T_matrix& (U_Q)
+//   stm.eigenvalues_q(site_c)          -> const T_vector& (λ_Q)
+//   stm.inverse_eigenvectors_q(site_c) -> const T_matrix& (U_Q⁻¹)
+// where T_matrix / T_vector are Eigen::Matrix<Scalar,...> with Scalar
+// either double or std::complex<double>.
 
 #include <cmath>
+#include <complex>
 #include <cstddef>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -71,27 +80,39 @@ struct hobolth_jensen_aggregate {
     Eigen::VectorXd T_total;  ///< k,     summed E[T_i  | y] across (tree, edge, site)
 };
 
+// ── Scalar extraction helpers ────────────────────────────────────────────────
+//
+// to_real(x): extract the real part regardless of whether the scalar is real
+// or complex. Used when collapsing complex aggregates onto the real-valued
+// hobolth_jensen_aggregate at the end of the math pipeline.
+
+inline double to_real(double x) { return x; }
+inline double to_real(const std::complex<double>& x) { return x.real(); }
+
 /*!
  * @brief Numerically stable sinhc kernel for the Hobolth-Jensen J-integral.
  *
  *   J_{pq}(t) = t · exp(t(λ_p+λ_q)/2) · sinhc(t(λ_p-λ_q)/2)
  *
- * Uses a small-|x| threshold (|x| < 1e-8) to return 1.0 directly, avoiding
- * 0/0 when λ_p ≈ λ_q.
+ * Uses a small-|x| threshold (|x| < 1e-8) to return 1 directly, avoiding
+ * 0/0 when λ_p ≈ λ_q. Templated on Scalar so both real (double) and complex
+ * (std::complex<double>) eigenvalues are handled — std::sinh / std::exp /
+ * std::abs have appropriate complex overloads.
  */
-inline double hobolth_jensen_kernel_real(double lambda_p,
-                                         double lambda_q,
-                                         double t)
+template <typename Scalar>
+inline Scalar hobolth_jensen_kernel(Scalar lambda_p,
+                                    Scalar lambda_q,
+                                    double t)
 {
-    const double half_sum  = 0.5 * t * (lambda_p + lambda_q);
-    const double half_diff = 0.5 * t * (lambda_p - lambda_q);
-    double sinhc;
+    const Scalar half_sum  = Scalar(0.5) * Scalar(t) * (lambda_p + lambda_q);
+    const Scalar half_diff = Scalar(0.5) * Scalar(t) * (lambda_p - lambda_q);
+    Scalar sinhc;
     if (std::abs(half_diff) < 1e-8) {
-        sinhc = 1.0;
+        sinhc = Scalar(1.0);
     } else {
         sinhc = std::sinh(half_diff) / half_diff;
     }
-    return t * std::exp(half_sum) * sinhc;
+    return Scalar(t) * std::exp(half_sum) * sinhc;
 }
 
 /*!
@@ -105,17 +126,31 @@ inline double hobolth_jensen_kernel_real(double lambda_p,
  *     been run for every tree → edge_inside_buffer and outside_buffer are
  *     populated.
  *
- * The problem's stm must be a reversible_ctmc_model — accessors
- * eigenvectors(site), eigenvalues(site), sqrt_pi(site), inv_sqrt_pi(site)
- * are dispatched directly on *problem.stm.
+ * The problem's stm must expose the uniform "of Q" eigendecomposition API
+ * (eigenvectors_q / eigenvalues_q / inverse_eigenvectors_q). The scalar type
+ * (double or std::complex<double>) is deduced from those accessors at compile
+ * time, so reversible_ctmc_model uses real arithmetic and ctmc_model uses
+ * complex arithmetic without runtime dispatch.
  *
- * @tparam Problem joint_optimization_problem<reversible_ctmc_model, ...>
- *                 subclass with the standard buffer + posterior accessors.
+ * @tparam Problem joint_optimization_problem<Model, ...> subclass with the
+ *                 standard buffer + posterior accessors. Model must implement
+ *                 the eigendecomposition-of-Q accessors above.
  */
 template <typename Problem>
 hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
 {
-    const auto& stm = *problem.stm;
+    auto& stm = *problem.stm;
+
+    // ── Deduce scalar / matrix / vector types from the model ────────────────
+    using EigVecT  = std::decay_t<decltype(stm.eigenvalues_q(0))>;
+    using Scalar   = typename EigVecT::Scalar;
+    using MatT     = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    using VecT     = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
+
+    static_assert(
+        std::is_same<Scalar, double>::value ||
+        std::is_same<Scalar, std::complex<double>>::value,
+        "hobolth_jensen_stats: model scalar must be double or std::complex<double>");
 
     // Resolve k from site 0; require it to be uniform across sites.
     if (stm.sites_latent_states.empty()) {
@@ -136,13 +171,15 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
 
     const std::size_t num_sites = stm.sites_latent_states.size();
 
-    // Per-site scratch reused inside the inner loop.
+    // Per-site scratch reused inside the inner loop. Real W_e is the natural
+    // form (it comes from exp(log-likelihoods)); we cast it to Scalar before
+    // entering the eigenspace math so complex models share the pipeline.
     Eigen::MatrixXd W_e(k, k);
-    Eigen::MatrixXd Wtilde(k, k);
-    Eigen::MatrixXd G_e(k, k);
-    Eigen::MatrixXd J_e(k, k);
-    Eigen::MatrixXd H(k, k);
-    Eigen::MatrixXd C(k, k);
+    MatT            W_e_typed(k, k);
+    MatT            G_e(k, k);
+    MatT            J_e(k, k);
+    MatT            H(k, k);
+    MatT            C(k, k);
     std::vector<double> log_sib(k);
 
     for (std::size_t ti = 0; ti < problem.trees.size(); ++ti) {
@@ -152,17 +189,21 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
         const auto& outside_ll  = problem.outside_buffer(ti);
 
         for (std::size_t c = 0; c < num_sites; ++c) {
-            const Eigen::MatrixXd& U          = stm.eigenvectors(c);
-            const Eigen::VectorXd& lambda     = stm.eigenvalues(c);
-            const Eigen::VectorXd& sqrt_pi    = stm.sqrt_pi(c);
-            const Eigen::VectorXd& inv_sqrt_pi= stm.inv_sqrt_pi(c);
+            const MatT& U_Q     = stm.eigenvectors_q(c);
+            const VecT& lambda  = stm.eigenvalues_q(c);
+            const MatT& U_Q_inv = stm.inverse_eigenvectors_q(c);
 
-            // Q[i,j] = inv_sqrt_pi[i] * sqrt_pi[j] · Σ_p U[i,p] λ_p U[j,p]
-            // We materialize the full real Q matrix once per site; this is
-            // O(k^3) — negligible for k=4.
-            Eigen::MatrixXd Q = inv_sqrt_pi.asDiagonal()
-                              * U * lambda.asDiagonal() * U.transpose()
-                              * sqrt_pi.asDiagonal();
+            // Q[i, j] = (U_Q · diag(λ) · U_Q⁻¹)[i, j]. For reversible models
+            // this is a real matrix; for general ctmc_model the imaginary
+            // parts cancel modulo numerical noise. We always materialize a
+            // real Q so we can multiply it cleanly against the (real)
+            // N_total aggregate later. The product is k×k → O(k^3),
+            // negligible for typical k.
+            MatT Q_typed = U_Q * lambda.asDiagonal() * U_Q_inv;
+            Eigen::MatrixXd Q(k, k);
+            for (std::size_t i = 0; i < k; ++i)
+                for (std::size_t j = 0; j < k; ++j)
+                    Q(i, j) = to_real(Q_typed(i, j));
 
             const double log_p_y = problem.log_p_y(ti, c);
 
@@ -195,15 +236,16 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
                     }
                 }
 
-                // Wtilde = diag(1/√π) · W_e · diag(√π)
-                // G_e    = Uᵀ · Wtilde · U
-                Wtilde = inv_sqrt_pi.asDiagonal() * W_e * sqrt_pi.asDiagonal();
-                G_e    = U.transpose() * Wtilde * U;
+                // Promote real W_e into the (possibly complex) Scalar field.
+                W_e_typed = W_e.template cast<Scalar>();
+
+                // G_e = U_Qᵀ · W_e · (U_Q⁻¹)ᵀ
+                G_e = U_Q.transpose() * W_e_typed * U_Q_inv.transpose();
 
                 // J_e[p, q] = kernel(λ_p, λ_q, t_e)
                 for (std::size_t p = 0; p < k; ++p) {
                     for (std::size_t q = 0; q < k; ++q) {
-                        J_e(p, q) = hobolth_jensen_kernel_real(
+                        J_e(p, q) = hobolth_jensen_kernel<Scalar>(
                             lambda[p], lambda[q], t_e);
                     }
                 }
@@ -211,17 +253,16 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
                 H += G_e.cwiseProduct(J_e);
             }
 
-            // C = diag(√π) · U · H · Uᵀ · diag(1/√π)
-            C = sqrt_pi.asDiagonal() * U * H * U.transpose()
-                * inv_sqrt_pi.asDiagonal();
+            // C = (U_Q⁻¹)ᵀ · H · U_Qᵀ
+            C = U_Q_inv.transpose() * H * U_Q.transpose();
 
             for (std::size_t i = 0; i < k; ++i)
-                agg.T_total[i] += C(i, i);
+                agg.T_total[i] += to_real(C(i, i));
 
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t j = 0; j < k; ++j)
                     if (i != j)
-                        agg.N_total(i, j) += Q(i, j) * C(i, j);
+                        agg.N_total(i, j) += Q(i, j) * to_real(C(i, j));
         }
     }
 

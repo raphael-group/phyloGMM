@@ -72,12 +72,28 @@ public:
     const Eigen::VectorXd& sqrt_pi(size_t site)       const { return cache[site].sqrt_pi;      }
     const Eigen::VectorXd& inv_sqrt_pi(size_t site)   const { return cache[site].inv_sqrt_pi;  }
 
+    // ── Uniform "of Q" accessors (model-agnostic; shared with ctmc_model) ────
+    //
+    // For reversible Q the eigendecomposition of A = diag(√π)·Q·diag(1/√π)
+    // (orthogonal U_A, real λ_A) lifts to Q itself via:
+    //     U_Q     = diag(1/√π) · U_A
+    //     U_Q⁻¹  = U_Aᵀ · diag(√π)
+    //     λ_Q    = λ_A
+    // All three are real for reversible models. These are cached during
+    // build() so that templated callers (e.g. optimize::hobolth_jensen_stats)
+    // can use the same API across reversible_ctmc_model and ctmc_model.
+    const Eigen::MatrixXd& eigenvectors_q(size_t site)         const { return cache[site].U_Q;     }
+    const Eigen::VectorXd& eigenvalues_q(size_t site)          const { return cache[site].lambda;  }
+    const Eigen::MatrixXd& inverse_eigenvectors_q(size_t site) const { return cache[site].U_Q_inv; }
+
 private:
     struct site_cache {
         Eigen::MatrixXd U;            // eigenvectors of symmetric similarity transform
         Eigen::VectorXd lambda;       // eigenvalues
         Eigen::VectorXd sqrt_pi;
         Eigen::VectorXd inv_sqrt_pi;
+        Eigen::MatrixXd U_Q;          // eigenvectors of Q = diag(1/√π) · U
+        Eigen::MatrixXd U_Q_inv;      // inverse of U_Q   = Uᵀ · diag(√π)
     };
     std::vector<site_cache> cache;  // one per site, filled by build()
 };

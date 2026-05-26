@@ -1,4 +1,4 @@
-#ifndef PHYLOCORE_STATE_TRANSITION_MODELS_CTMC_H
+ #ifndef PHYLOCORE_STATE_TRANSITION_MODELS_CTMC_H
 #define PHYLOCORE_STATE_TRANSITION_MODELS_CTMC_H
 
 #include <complex>
@@ -52,6 +52,24 @@ public:
         size_t          alpha,
         size_t          beta
     ) const override;
+
+    // ── Uniform "of Q" accessors (model-agnostic; shared with reversible) ────
+    //
+    // For a general (possibly non-reversible) Q, the eigendecomposition is
+    //     Q = U_Q · diag(λ_Q) · U_Q⁻¹
+    // with U_Q, λ_Q, U_Q⁻¹ complex in general. ctmc_model maintains a single
+    // shared cache (one Q across the tree), so the site argument is ignored.
+    // These accessors mirror the ones on reversible_ctmc_model so that
+    // templated callers (e.g. optimize::hobolth_jensen_stats) can deduce
+    // the scalar type at compile time.
+    const Eigen::MatrixXcd& eigenvectors_q(size_t /*site*/)         const { return cache.U;      }
+    const Eigen::VectorXcd& eigenvalues_q(size_t /*site*/)          const { return cache.lambda; }
+    const Eigen::MatrixXcd& inverse_eigenvectors_q(size_t /*site*/) const { return cache.U_inv;  }
+
+    // Direct access to the underlying real rate matrix Q (used by callers
+    // that need Q_ij directly, e.g. for posterior expected substitution
+    // counts in hobolth_jensen_stats).
+    const Eigen::MatrixXd& rate_matrix() const { return Q; }
 
 private:
     // Single shared cache: one Q applies across the whole tree.
