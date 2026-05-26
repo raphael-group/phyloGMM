@@ -48,47 +48,44 @@ struct equality_constraint   {};
 struct inequality_constraint {};
 
 /*!
- * @brief Abstract base for an optimization problem over (model, observations, trees).
+ * @brief Abstract base encapsulating everything one optimization run needs.
  *
- * Supports a set of trees that share model parameters (e.g., a single Q across
- * loci, or shared ν/φ across replicates) while possibly having independent
- * per-tree branch lengths. Single-tree is the size-1 special case.
+ * Two roles in one object:
  *
- * The user provides pointers to the model components (stm, obs), the global
- * observation data (observed_data, metadata), and the per-tree state (trees,
- * node_data). The user does NOT allocate any likelihood buffers — the library
- * lazily allocates them internally on first use.
+ * 1. User-facing contract (the user subclasses and supplies):
+ *      Required: get_params(), set_params()
+ *      Optional: log_likelihood(), bounds(), gradient(),
+ *                equality_constraints(), inequality_constraints()
+ *      For EM:   using suff_stats_type = ...; compute_suff_stats(self),
+ *                m_step(self, suff_stats)   (added directly to the subclass;
+ *                                            Pattern B duck typing — no
+ *                                            inheritance from em_extension)
  *
- * Required overrides:
- *   - get_params() : pack the currently-being-estimated parameters into a flat
- *                    vector. Things held fixed do NOT appear in this vector.
- *   - set_params() : unpack the flat vector back into model state; refresh any
- *                    caches (typically by calling stm->build() / obs->build()).
- *                    Throw invalid_parameters_error on invalid input.
+ * 2. Library-managed E-step state:
+ *      Per-tree likelihood_buffers for inside, edge_inside, outside passes
+ *      (lazily allocated, sized per-tree).
+ *      Per-tree log_total_likelihood (populated by log_likelihood()).
+ *      Lazy posterior accessors — node_posterior, edge_posterior,
+ *      root_posterior, leaf_posterior — that compute on demand from the
+ *      buffers. These are what the user's compute_suff_stats reads from.
  *
- * Optional overrides (library defaults provided):
- *   - log_likelihood()           — defaults to summed inside log-Ls across trees.
- *   - bounds()                   — defaults to unbounded (empty vector).
- *   - gradient()                 — defaults to empty (caller uses finite-diff).
- *   - equality_constraints()     — defaults to none.
- *   - inequality_constraints()   — defaults to none.
+ * Supports a set of trees that share model parameters (e.g., a single Q
+ * across loci, or shared ν/φ across replicates) while possibly having
+ * independent per-tree branch lengths. Single-tree is the size-1 special
+ * case. The inside-likelihood code looks up each leaf's observation via the
+ * taxa_id stored in the digraph node's data field — decoupled from
+ * tree-local node_id — so observed_data and metadata are single global
+ * vectors, not per-tree.
  *
- * For EM, the user additionally adds (directly on their subclass — Pattern B
- * duck typing, NOT via inheritance from em_extension):
- *   - using suff_stats_type      = ...   // model-defined
- *   - suff_stats_type compute_suff_stats(self, const standard_posteriors&)
- *   - void              m_step(self, const suff_stats_type&)
- *
- * See docs/parameter_estimation.md for the full contract and the five
- * optimization modes (Direct MLE finite-diff / analytic, EM joint M-step
- * finite-diff / analytic, EM closed-form M-step).
+ * See docs/parameter_estimation.md for the five optimization modes and
+ * the full design rationale.
  *
  * @tparam Stm       Concrete state_transition_model subclass.
  * @tparam ObsModel  Concrete observation_model subclass.
  * @tparam O         Per-leaf observation type (e.g., std::vector<int> for
  *                   discrete, Eigen::VectorXd for continuous).
- * @tparam D         Per-node data type. Defaults to std::monostate for models
- *                   that need no per-node state.
+ * @tparam D         Per-node data type. Defaults to std::monostate for
+ *                   models that need no per-node state.
  */
 template <typename Stm,
           typename ObsModel,
@@ -101,15 +98,9 @@ public:
     Stm*      stm = nullptr;
     ObsModel* obs = nullptr;
 
-    // Global, shared across all trees. The inside-likelihood code looks up
-    // each leaf's observation via the taxa_id stored in the digraph node's
-    // data field — decoupled from tree-local node_id. So a single
-    // observed_data and a single metadata cover the whole dataset, including
-    // cases where leaves move between trees during topology search.
     const std::vector<O>* observed_data = nullptr;
     const meta_data*      metadata      = nullptr;
 
-    // Per-tree state (indices kept in sync across these two vectors).
     std::vector<tree*>             trees;
     std::vector<std::vector<D>*>   node_data;
 
@@ -120,9 +111,9 @@ public:
     /*!
      * @brief Pack the parameters being estimated into a flat vector.
      *
-     * For a multi-parameter / multi-tree problem the user is responsible for
-     * the layout: e.g., [Q_off_diag..., μ..., Σ..., π..., blens_tree_0...,
-     * blens_tree_1...]. Things held fixed are NOT included.
+     * For multi-parameter / multi-tree problems the user controls the layout
+     * (e.g., [Q_off_diag..., μ..., Σ..., π..., blens_tree_0...,
+     * blens_tree_1...]). Things held fixed are NOT included.
      */
     virtual std::vector<double> get_params() const = 0;
 
@@ -130,9 +121,9 @@ public:
      * @brief Unpack the flat vector back into model state.
      *
      * Must refresh any caches (typically by calling stm->build() and/or
-     * obs->build()). Throws invalid_parameters_error if the parameters violate
-     * a model invariant; the optimizer translates this into an "evaluation
-     * failed" return and may backtrack.
+     * obs->build()). Throws invalid_parameters_error if the parameters
+     * violate a model invariant; the optimizer translates this into an
+     * "evaluation failed" return and may backtrack.
      */
     virtual void set_params(const std::vector<double>& params) = 0;
 
@@ -140,63 +131,197 @@ public:
 
     /*!
      * @brief Total log-likelihood. Default: sum, over each tree, of the
-     *        per-site inside log-likelihoods.
+     *        per-site inside log-likelihoods. Also populates per-tree
+     *        log_total_likelihood storage as a side effect (consumed by
+     *        posterior accessors).
      *
-     * Override to add prior terms (MAP-style estimation) or regularizers.
+     * Override to add prior terms (MAP-style estimation) or regularizers —
+     * but if you override, call this base implementation first (or otherwise
+     * populate log_total_L_per_tree_) so posterior accessors keep working.
      */
     virtual double log_likelihood() {
         ensure_inside_buffers_allocated_();
+        log_total_L_per_tree_.assign(trees.size(), 0.0);
         double total = 0.0;
         for (std::size_t i = 0; i < trees.size(); ++i) {
             auto per_site = phylocore::compute_inside_log_likelihood(
                 *stm, *obs, *observed_data, *metadata,
                 *trees[i], *inside_buffers_[i], *node_data[i]);
-            for (double v : per_site) total += v;
+            double tree_total = 0.0;
+            for (double v : per_site) tree_total += v;
+            log_total_L_per_tree_[i] = tree_total;
+            total += tree_total;
         }
         return total;
     }
 
     /*!
      * @brief Per-parameter (lower, upper) bounds. Default: empty (unbounded).
-     *
-     * If non-empty, size must equal get_params().size().
+     *        When non-empty, size must equal get_params().size().
      */
     virtual std::vector<std::pair<double, double>> bounds() const { return {}; }
 
     /*!
      * @brief Analytic gradient of log_likelihood w.r.t. get_params(). Default:
-     *        empty — callers (optimize::direct) interpret empty as "use
-     *        finite-difference gradient." Overriding lifts the problem from
-     *        mode #1/#3 (slow finite-diff) to mode #2/#4 (fast analytic).
+     *        empty — callers interpret empty as "use finite-difference
+     *        gradient." Overriding lifts the problem from modes #1/#3 (slow
+     *        finite-diff) to modes #2/#4 (fast analytic).
      */
     virtual std::vector<double> gradient() { return {}; }
 
     virtual std::vector<equality_constraint>   equality_constraints()   const { return {}; }
     virtual std::vector<inequality_constraint> inequality_constraints() const { return {}; }
 
-protected:
-    // ── Library-internal buffer access (for use by optimize:: algorithms) ────
+    // ── Library-managed E-step state ─────────────────────────────────────────
     //
-    // The inside buffer is lazily allocated on first log_likelihood() call.
-    // Edge-inside and outside buffers will be allocated on demand by
-    // optimize::em (or any algorithm that needs them); we defer allocating
-    // them here to avoid paying the memory cost for Direct-MLE-only problems.
+    // Buffer accessors. Lazily allocated on first call. Public for use by
+    // optimize::* algorithms (which run the three traversals on them); user
+    // code generally doesn't touch these directly.
 
     likelihood_buffer& inside_buffer(std::size_t tree_idx) {
         ensure_inside_buffers_allocated_();
         return *inside_buffers_[tree_idx];
     }
 
-    std::size_t num_trees() const noexcept { return trees.size(); }
+    likelihood_buffer& edge_inside_buffer(std::size_t tree_idx) {
+        ensure_edge_inside_buffers_allocated_();
+        return *edge_inside_buffers_[tree_idx];
+    }
+
+    likelihood_buffer& outside_buffer(std::size_t tree_idx) {
+        ensure_outside_buffers_allocated_();
+        return *outside_buffers_[tree_idx];
+    }
+
+    // ── Posterior accessors ──────────────────────────────────────────────────
+    //
+    // Valid only after the EM driver has run the three traversal passes
+    // (inside via log_likelihood(); edge_inside and outside via
+    // phylocore::compute_edge_inside_log_likelihood and
+    // phylocore::compute_outside_log_likelihood on the buffers above).
+    //
+    // All values are in LOG SPACE. Caller applies exp() when needed.
+
+    /*!
+     * @brief log γ_v(i) = log P(z_v = i | y) at site c, node v.
+     *
+     * Returns a vector of length alphabet_size(c). Valid for any node v in
+     * tree tree_idx (leaves, internal, root).
+     */
+    std::vector<double> node_posterior(
+        std::size_t tree_idx, std::size_t node_id, std::size_t site_c)
+    {
+        const std::size_t alpha =
+            stm->sites_latent_states[site_c].alphabet_size;
+        std::vector<double> result(alpha);
+        const auto& in  = inside_buffer(tree_idx);
+        const auto& out = outside_buffer(tree_idx);
+        const double L  = log_total_L_per_tree_[tree_idx];
+        for (std::size_t i = 0; i < alpha; ++i) {
+            result[i] = in(site_c, node_id, i)
+                      + out(site_c, node_id, i)
+                      - L;
+        }
+        return result;
+    }
+
+    /*!
+     * @brief log γ_e(i, j) = log P(z_parent = i, z_child = j | y) at site c
+     *        for the edge from parent w to child_node_id.
+     *
+     * Returns a k × k matrix (in log space). Multifurcation-supporting:
+     * M_{w→u}(i) = outside(w, i) + Σ_{siblings z of u} edge_inside(z, i).
+     *
+     * Throws std::invalid_argument if child_node_id is the root (no
+     * incoming edge in the phylogeny sense).
+     */
+    std::vector<std::vector<double>> edge_posterior(
+        std::size_t tree_idx, std::size_t child_node_id, std::size_t site_c)
+    {
+        const tree& t = *trees[tree_idx];
+        if (t.tree.in_degree(child_node_id) == 0) {
+            throw std::invalid_argument(
+                "edge_posterior: node has no parent (is root)");
+        }
+
+        const std::size_t alpha =
+            stm->sites_latent_states[site_c].alphabet_size;
+        const auto& in  = inside_buffer(tree_idx);
+        const auto& ei  = edge_inside_buffer(tree_idx);
+        const auto& out = outside_buffer(tree_idx);
+        const double L  = log_total_L_per_tree_[tree_idx];
+
+        const std::size_t parent_id =
+            t.tree.predecessors(child_node_id)[0];
+
+        // M_{w→u}(i) = outside(w, i) + Σ_{siblings z of u} edge_inside(z, i)
+        std::vector<double> M(alpha);
+        for (std::size_t i = 0; i < alpha; ++i) {
+            M[i] = out(site_c, parent_id, i);
+        }
+        for (auto sibling_id : t.tree.successors(parent_id)) {
+            if (static_cast<std::size_t>(sibling_id) == child_node_id) continue;
+            for (std::size_t i = 0; i < alpha; ++i) {
+                M[i] += ei(site_c, sibling_id, i);
+            }
+        }
+
+        // γ_e(i, j) = M(i) + log P^c(t_u)_{ij} + inside(u, j) - log_total_L
+        const double branch_length = t.branch_lengths[child_node_id];
+        std::vector<std::vector<double>> result(
+            alpha, std::vector<double>(alpha));
+        for (std::size_t i = 0; i < alpha; ++i) {
+            for (std::size_t j = 0; j < alpha; ++j) {
+                const double log_P_ij = stm->compute_log_transition_probability(
+                    (*node_data[tree_idx])[child_node_id],
+                    site_c, branch_length, i, j);
+                result[i][j] = M[i] + log_P_ij
+                             + in(site_c, child_node_id, j)
+                             - L;
+            }
+        }
+        return result;
+    }
+
+    /*!
+     * @brief Convenience: log γ_root(i) at site c. Same as node_posterior
+     *        called on the tree's root_id.
+     */
+    std::vector<double> root_posterior(
+        std::size_t tree_idx, std::size_t site_c)
+    {
+        return node_posterior(tree_idx, trees[tree_idx]->root_id, site_c);
+    }
+
+    /*!
+     * @brief Convenience: log γ_ℓ(i) at site c for a leaf. Same as
+     *        node_posterior; named for clarity in compute_suff_stats code
+     *        that aggregates leaf responsibilities (e.g., phyloGMM).
+     */
+    std::vector<double> leaf_posterior(
+        std::size_t tree_idx, std::size_t leaf_node_id, std::size_t site_c)
+    {
+        return node_posterior(tree_idx, leaf_node_id, site_c);
+    }
+
+    /*!
+     * @brief Per-tree total log-likelihood. Populated by log_likelihood().
+     *        Used internally by posterior accessors as the normalization
+     *        constant; also useful to read directly.
+     */
+    double log_total_likelihood(std::size_t tree_idx) const {
+        return log_total_L_per_tree_[tree_idx];
+    }
 
 private:
     std::vector<std::unique_ptr<likelihood_buffer>> inside_buffers_;
+    std::vector<std::unique_ptr<likelihood_buffer>> edge_inside_buffers_;
+    std::vector<std::unique_ptr<likelihood_buffer>> outside_buffers_;
+    std::vector<double>                             log_total_L_per_tree_;
 
-    void ensure_inside_buffers_allocated_() {
-        if (inside_buffers_.size() == trees.size()) return;
-        inside_buffers_.clear();
-        if (trees.empty()) return;
-
+    // Compute (num_sites, max_alpha) from the model — shared by all three
+    // buffer allocators.
+    std::pair<std::size_t, std::size_t> buffer_dims_() const {
         const std::size_t num_sites = stm->sites_latent_states.size();
         const std::size_t max_alpha = std::max_element(
             stm->sites_latent_states.begin(),
@@ -204,11 +329,35 @@ private:
             [](const state_space& a, const state_space& b) {
                 return a.alphabet_size < b.alphabet_size;
             })->alphabet_size;
+        return {num_sites, max_alpha};
+    }
 
-        inside_buffers_.reserve(trees.size());
+    void allocate_buffers_(
+        std::vector<std::unique_ptr<likelihood_buffer>>& target)
+    {
+        target.clear();
+        if (trees.empty()) return;
+        const auto [num_sites, max_alpha] = buffer_dims_();
+        target.reserve(trees.size());
         for (tree* t : trees) {
-            inside_buffers_.push_back(std::make_unique<likelihood_buffer>(
+            target.push_back(std::make_unique<likelihood_buffer>(
                 num_sites, max_alpha, t->num_nodes));
+        }
+    }
+
+    void ensure_inside_buffers_allocated_() {
+        if (inside_buffers_.size() != trees.size()) {
+            allocate_buffers_(inside_buffers_);
+        }
+    }
+    void ensure_edge_inside_buffers_allocated_() {
+        if (edge_inside_buffers_.size() != trees.size()) {
+            allocate_buffers_(edge_inside_buffers_);
+        }
+    }
+    void ensure_outside_buffers_allocated_() {
+        if (outside_buffers_.size() != trees.size()) {
+            allocate_buffers_(outside_buffers_);
         }
     }
 };
