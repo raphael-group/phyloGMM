@@ -43,9 +43,27 @@ add_library(phylocore_core STATIC
 target_include_directories(phylocore_core PUBLIC include ${csv-parser_SOURCE_DIR}/include)
 target_link_libraries(phylocore_core PUBLIC Eigen3::Eigen)
 
+# ── IPOPT (required by consumers that include optimize/direct.h) ────────────
+# Pulled in per-executable rather than added to phylocore_core.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(IPOPT REQUIRED IMPORTED_TARGET ipopt>=3)
+
 # ── Driver: run_gtr ──────────────────────────────────────────────────────────
 add_executable(run_gtr src/run_gtr.cxx)
-target_link_libraries(run_gtr PRIVATE phylocore_core csv)
+target_link_libraries(run_gtr PRIVATE phylocore_core csv PkgConfig::IPOPT)
+target_compile_definitions(run_gtr
+    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+# ── Driver: run_gtr_em ───────────────────────────────────────────────────────
+# Hobolth-Jensen EM driver. optimize/em.h is header-only and does NOT depend
+# on IPOPT (Mode #5 in docs/parameter_estimation.md), so this target links
+# only against phylocore_core.
+add_executable(run_gtr_em src/run_gtr_em.cxx)
+target_link_libraries(run_gtr_em PRIVATE phylocore_core csv)
+target_compile_definitions(run_gtr_em
+    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
 # ── Tests / drivers (disabled until consumer fixes land) ─────────────────────
 # test_gtr, test_phylo_gmm, test_laml, run_phylo_gmm all need
@@ -59,6 +77,10 @@ target_link_libraries(test_gtr_raxml PRIVATE phylocore_core csv)
 target_compile_definitions(test_gtr_raxml
     PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+# ── Smoke test: optimize::direct (IPOPT) ─────────────────────────────────────
+add_executable(direct_smoke tests/optimize/direct_smoke.cxx)
+target_link_libraries(direct_smoke PRIVATE phylocore_core PkgConfig::IPOPT)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:

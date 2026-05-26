@@ -141,16 +141,14 @@ public:
      */
     virtual double log_likelihood() {
         ensure_inside_buffers_allocated_();
-        log_total_L_per_tree_.assign(trees.size(), 0.0);
+        log_p_y_per_tree_per_site_.assign(trees.size(), {});
         double total = 0.0;
         for (std::size_t i = 0; i < trees.size(); ++i) {
             auto per_site = phylocore::compute_inside_log_likelihood(
                 *stm, *obs, *observed_data, *metadata,
                 *trees[i], *inside_buffers_[i], *node_data[i]);
-            double tree_total = 0.0;
-            for (double v : per_site) tree_total += v;
-            log_total_L_per_tree_[i] = tree_total;
-            total += tree_total;
+            for (double v : per_site) total += v;
+            log_p_y_per_tree_per_site_[i] = std::move(per_site);
         }
         return total;
     }
@@ -216,7 +214,7 @@ public:
         std::vector<double> result(alpha);
         const auto& in  = inside_buffer(tree_idx);
         const auto& out = outside_buffer(tree_idx);
-        const double L  = log_total_L_per_tree_[tree_idx];
+        const double L  = log_p_y_per_tree_per_site_[tree_idx][site_c];
         for (std::size_t i = 0; i < alpha; ++i) {
             result[i] = in(site_c, node_id, i)
                       + out(site_c, node_id, i)
@@ -249,7 +247,7 @@ public:
         const auto& in  = inside_buffer(tree_idx);
         const auto& ei  = edge_inside_buffer(tree_idx);
         const auto& out = outside_buffer(tree_idx);
-        const double L  = log_total_L_per_tree_[tree_idx];
+        const double L  = log_p_y_per_tree_per_site_[tree_idx][site_c];
 
         const std::size_t parent_id =
             t.tree.predecessors(child_node_id)[0];
@@ -305,19 +303,35 @@ public:
     }
 
     /*!
-     * @brief Per-tree total log-likelihood. Populated by log_likelihood().
-     *        Used internally by posterior accessors as the normalization
-     *        constant; also useful to read directly.
+     * @brief Per-site marginal log-likelihood. log p(y_c | tree_idx).
+     *
+     * This is what posterior accessors use for normalization, since
+     * inside(c, v, i) + outside(c, v, i) = log P(z_v = i, y_c) is a
+     * per-site joint, not joint across sites. Populated by log_likelihood().
+     */
+    double log_p_y(std::size_t tree_idx, std::size_t site_c) const {
+        return log_p_y_per_tree_per_site_[tree_idx][site_c];
+    }
+
+    /*!
+     * @brief Per-tree total log-likelihood: sum over sites of log p(y_c | tree).
+     *        Populated by log_likelihood() (computed on demand from the
+     *        per-site values).
      */
     double log_total_likelihood(std::size_t tree_idx) const {
-        return log_total_L_per_tree_[tree_idx];
+        double s = 0.0;
+        for (double v : log_p_y_per_tree_per_site_[tree_idx]) s += v;
+        return s;
     }
 
 private:
     std::vector<std::unique_ptr<likelihood_buffer>> inside_buffers_;
     std::vector<std::unique_ptr<likelihood_buffer>> edge_inside_buffers_;
     std::vector<std::unique_ptr<likelihood_buffer>> outside_buffers_;
-    std::vector<double>                             log_total_L_per_tree_;
+    // Per-tree, per-site log marginal: log_p_y_per_tree_per_site_[tree][site] = log p(y_site | tree).
+    // Populated by log_likelihood(). Consumed by node_posterior, edge_posterior,
+    // and external callers via log_p_y(tree_idx, site_c).
+    std::vector<std::vector<double>>                log_p_y_per_tree_per_site_;
 
     // Compute (num_sites, max_alpha) from the model — shared by all three
     // buffer allocators.

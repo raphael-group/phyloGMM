@@ -53,6 +53,25 @@ public:
         size_t          beta
     ) const override;
 
+    // ── Public accessors for the cached symmetric eigendecomposition ─────────
+    //
+    // For site c with stationary distribution π and symmetric-similarity-
+    // transformed rate matrix A = diag(√π) · Q · diag(1/√π), these expose:
+    //   eigenvectors(c) : orthogonal U such that A = U · diag(λ) · Uᵀ
+    //                     (so U_Q = diag(1/√π) · U,
+    //                      and U_Q⁻¹ = Uᵀ · diag(√π))
+    //   eigenvalues(c)  : λ (real, since A is symmetric)
+    //   sqrt_pi(c)      : √π
+    //   inv_sqrt_pi(c)  : 1/√π
+    //
+    // These are needed by optimize::hobolth_jensen_stats to compute
+    // expected sufficient statistics for a CTMC EM step without
+    // re-running the eigensolver.
+    const Eigen::MatrixXd& eigenvectors(size_t site)  const { return cache[site].U;            }
+    const Eigen::VectorXd& eigenvalues(size_t site)   const { return cache[site].lambda;       }
+    const Eigen::VectorXd& sqrt_pi(size_t site)       const { return cache[site].sqrt_pi;      }
+    const Eigen::VectorXd& inv_sqrt_pi(size_t site)   const { return cache[site].inv_sqrt_pi;  }
+
 private:
     struct site_cache {
         Eigen::MatrixXd U;            // eigenvectors of symmetric similarity transform
