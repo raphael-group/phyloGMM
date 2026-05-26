@@ -82,6 +82,10 @@ target_compile_definitions(test_gtr_raxml
 add_executable(direct_smoke tests/optimize/direct_smoke.cxx)
 target_link_libraries(direct_smoke PRIVATE phylocore_core PkgConfig::IPOPT)
 
+# ── Test infra: phyloGMM synthetic data simulator ────────────────────────────
+add_executable(simulate_phylo_gmm tests/phylo_gmm/simulate.cxx)
+target_link_libraries(simulate_phylo_gmm PRIVATE phylocore_core)
+
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
 # find_package(pybind11 REQUIRED)
