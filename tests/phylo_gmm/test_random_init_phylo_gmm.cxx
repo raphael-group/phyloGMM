@@ -603,7 +603,12 @@ int main() {
         if (r.log_likelihood > best->log_likelihood) best = &r;
 
     const double best_log_L = best->log_likelihood;
-    const double match_tol  = 1e-3;
+    // EM uses rel_tol = 1e-5 (LAML-Pro convention). Two restarts that find
+    // the same local optimum can stop up to ~|best_log_L| * 1e-5 apart due to
+    // stopping noise; 1e-2 covers that comfortably while still distinguishing
+    // genuinely-different optima (the bad-init basin in this fixture is >30
+    // nats away from the consensus optimum).
+    const double match_tol  = 1e-2;
 
     // Count how many reached the consensus best.
     int num_at_best = 0;

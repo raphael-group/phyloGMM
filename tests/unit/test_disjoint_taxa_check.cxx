@@ -182,6 +182,30 @@ int main() {
             "overlap with taxa_id 5 is caught by validate_disjoint_taxa");
     }
 
+    // (4) WITHIN-TREE duplicate case: a single taxa_id appearing at two leaves
+    // of the same tree must be rejected with a message that says "tree 0" and
+    // names the offending taxa_id. Previously this slipped through (the cross-
+    // tree map only catches duplicates whose first sighting is in a DIFFERENT
+    // tree), so the duplicate observation was silently double-counted in
+    // suff_stats.
+    {
+        auto f = make_two_tree_fixture(/*tree0:*/ 4, 4, /*tree1:*/ 8, 9);
+        bool threw = false;
+        std::string msg;
+        try {
+            f.problem->validate_disjoint_taxa();
+        } catch (const std::invalid_argument& e) {
+            threw = true;
+            msg = e.what();
+        }
+        expect_true(threw,
+            "duplicate taxa_id within the same tree should throw");
+        expect_true(msg.find("taxa_id 4") != std::string::npos,
+            "within-tree duplicate error names the offending taxa_id (4)");
+        expect_true(msg.find("tree 0") != std::string::npos,
+            "within-tree duplicate error names the tree index (0)");
+    }
+
     std::printf("test_disjoint_taxa_check: PASS\n");
     return 0;
 }

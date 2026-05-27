@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -326,21 +327,44 @@ public:
     }
 
     /*!
-     * @brief Throws std::invalid_argument if any taxa_id appears in more than
-     *        one tree.
+     * @brief Throws std::invalid_argument if any taxa_id appears more than
+     *        once across all leaves of all trees.
      *
-     * The library's design assumes disjoint taxa_ids across trees — the same
-     * taxon should not appear in multiple trees (since that would mean the
-     * same observation is counted multiple times in suff_stats, producing
-     * silently wrong results). Optimization entry points (optimize::em /
-     * optimize::direct) call this at the top of the main loop to surface the
-     * mistake with a clear message instead of returning garbage.
+     * The library's design assumes disjoint taxa_ids across trees AND distinct
+     * taxa_ids within a single tree — the same taxon should not appear at two
+     * leaves (whether in the same tree or different trees), since each
+     * additional occurrence would silently re-count the same observation in
+     * suff_stats and produce wrong results.
+     *
+     * Two failure modes are distinguished in the error message:
+     *   * within-tree duplicate: taxa_id appears at two leaves of the SAME
+     *     tree (rare, usually a fixture-construction bug);
+     *   * cross-tree duplicate: taxa_id appears in two DIFFERENT trees (the
+     *     more common multi-tree mistake).
+     *
+     * Optimization entry points (optimize::em / optimize::direct) call this at
+     * the top of the main loop to surface the mistake with a clear message
+     * instead of returning garbage.
      */
     void validate_disjoint_taxa() const {
         std::unordered_map<std::size_t, std::size_t> taxa_to_tree;
         for (std::size_t ti = 0; ti < trees.size(); ++ti) {
+            // First pass within this tree: catch within-tree duplicates with a
+            // distinct error message before the cross-tree map sees them.
+            std::unordered_set<std::size_t> seen_in_this_tree;
             for (std::size_t v = 0; v < trees[ti]->num_nodes; ++v) {
                 if (trees[ti]->tree.out_degree(static_cast<int>(v)) != 0) continue;  // leaves only
+                const std::size_t taxa_id = trees[ti]->tree[static_cast<int>(v)].data;
+                if (!seen_in_this_tree.insert(taxa_id).second) {
+                    throw std::invalid_argument(
+                        "joint_optimization_problem: taxa_id " + std::to_string(taxa_id) +
+                        " appears at two leaves of tree " + std::to_string(ti) +
+                        ". Library assumes distinct taxa within a tree.");
+                }
+            }
+            // Cross-tree pass: now record (and check against) the global map.
+            for (std::size_t v = 0; v < trees[ti]->num_nodes; ++v) {
+                if (trees[ti]->tree.out_degree(static_cast<int>(v)) != 0) continue;
                 const std::size_t taxa_id = trees[ti]->tree[static_cast<int>(v)].data;
                 auto it = taxa_to_tree.find(taxa_id);
                 if (it != taxa_to_tree.end() && it->second != ti) {

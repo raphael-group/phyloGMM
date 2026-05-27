@@ -76,22 +76,12 @@ target_compile_definitions(run_gtr_em
 )
 
 # ── Driver: run_phylo_gmm ────────────────────────────────────────────────────
-# phyloGMM EM driver. Closed-form M-step (Mode #5) — no IPOPT dependency.
+# phyloGMM EM driver on real data (Newick tree + CSV observations). Closed-form
+# M-step (Mode #5) — no IPOPT dependency. Synthetic-data coverage is provided
+# by the unit tests in tests/phylo_gmm/.
 add_executable(run_phylo_gmm src/run_phylo_gmm.cxx)
-target_link_libraries(run_phylo_gmm PRIVATE phylocore_core)
+target_link_libraries(run_phylo_gmm PRIVATE phylocore_core csv)
 target_compile_definitions(run_phylo_gmm
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
-
-# ── Driver: run_phylo_gmm_real ───────────────────────────────────────────────
-# Real-data phyloGMM EM driver. Mirrors the CLI of the OLD phylo_gmm-branch
-# `run_phylo_gmm` so the same fixtures can be fed to both implementations and
-# the outputs diffed (cross-implementation comparison, Task #33). Separate
-# target from `run_phylo_gmm` because the existing target embeds the synthetic
-# validation (and we don't want to regress its CTest behaviour).
-add_executable(run_phylo_gmm_real src/run_phylo_gmm_real.cxx)
-target_link_libraries(run_phylo_gmm_real PRIVATE phylocore_core csv)
-target_compile_definitions(run_phylo_gmm_real
     PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
