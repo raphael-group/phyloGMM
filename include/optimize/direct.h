@@ -34,6 +34,22 @@ struct direct_options {
     int    max_iter       = 200;
     bool   verbose        = false;
     double finite_diff_eps = 1e-6;   // step size for finite-diff gradient fallback
+
+    // If true, falls back to central-difference finite-diff gradient when
+    // problem.gradient() returns empty. Default: false — an analytic
+    // gradient is required.
+    //
+    // Set true ONLY when prototyping a new model. Finite-diff has subtle
+    // failure modes — e.g., the gtr_blens convergence failure caught during
+    // phyloGMM characterization, where central differences with eps=1e-6
+    // misbehaved as branches approached the 1e-8 lower bound, producing
+    // gradients that poisoned IPOPT's quasi-Newton Hessian and drove the
+    // objective in the wrong direction.
+    //
+    // For models with branch-length parameters, the canonical analytic
+    // gradient lives in optimize::branch_length_gradient (header
+    // optimize/branch_gradient.h).
+    bool   finite_diff_fallback = false;
 };
 
 namespace detail {
@@ -130,6 +146,13 @@ public:
             return true;
         }
 
+        if (!opts_.finite_diff_fallback) {
+            throw std::runtime_error(
+                "optimize::direct: gradient() returned empty and "
+                "finite_diff_fallback is false; provide an analytic "
+                "gradient (e.g., via optimize::branch_length_gradient)");
+        }
+
         // Finite-difference fallback (central differences).
         auto center = problem_.get_params();
         const double eps = opts_.finite_diff_eps;
@@ -218,13 +241,18 @@ private:
  * @brief Direct MLE via IPOPT.
  *
  * Maximizes problem.log_likelihood() over problem.get_params(). Supports
- * problem.bounds() and (when overridden) problem.gradient(). Empty
- * gradient() triggers central-difference finite-diff fallback — slow.
+ * problem.bounds() and requires problem.gradient() to return a non-empty
+ * analytic gradient — falling back to central-difference finite-diff only
+ * when opts.finite_diff_fallback is explicitly set to true (intended for
+ * prototyping; finite-diff has subtle failure modes near parameter
+ * bounds).
  *
  * On return, the problem is left at the optimized parameter state.
  *
- * @throws std::runtime_error if IPOPT fails to initialize or terminates
- *         abnormally (status worse than Solved_To_Acceptable_Level).
+ * @throws std::runtime_error if IPOPT fails to initialize, if
+ *         problem.gradient() returns empty while opts.finite_diff_fallback
+ *         is false, or if IPOPT terminates abnormally (status worse than
+ *         Solved_To_Acceptable_Level).
  */
 template <typename Problem>
 estimation_results direct(Problem& problem, direct_options opts = {}) {
@@ -236,6 +264,14 @@ estimation_results direct(Problem& problem, direct_options opts = {}) {
 
     SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
     app->Options()->SetStringValue("hessian_approximation", "limited-memory");
+    // Gradient-based scaling normalizes the objective gradient so the L-BFGS
+    // initial step (no curvature info, identity Hessian) does not overshoot
+    // when ||grad f|| is large in absolute terms — critical for likelihood
+    // surfaces where the gradient can easily reach O(10^2)-O(10^3).
+    // Drop nlp_scaling_max_gradient from its 100 default to 1 so the
+    // scaling kicks in even for moderately large gradients.
+    app->Options()->SetStringValue("nlp_scaling_method", "gradient-based");
+    app->Options()->SetNumericValue("nlp_scaling_max_gradient", 1.0);
     app->Options()->SetNumericValue("tol", opts.tol);
     app->Options()->SetIntegerValue("max_iter", opts.max_iter);
     if (!opts.verbose) {

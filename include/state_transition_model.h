@@ -49,6 +49,22 @@ public:
     // mathematically consistent with the scalar.
     bool has_optimized_functions = false;
 
+    // Whether branch_lengths[root_id] is a real parameter in the likelihood
+    // or a flat ridge that should be skipped during optimization.
+    //
+    // For reversible CTMCs with root_prior = stationary(Q): π · P(t) = π for
+    // all t, so the root branch is a no-op (false). For models where
+    // root_prior ≠ stationary, or where the root branch carries additional
+    // contributions (e.g., LAML's silencing rate ν on the root edge), set
+    // to true.
+    //
+    // Used by user-side branch-length optimization (e.g., gtr_blens_problem):
+    //   if (v == t->root_id && !stm->has_meaningful_root_branch) continue;
+    //
+    // Default: false. Models that genuinely use the root branch override to
+    // true (typically in their constructor or build()).
+    bool has_meaningful_root_branch = false;
+
     virtual ~state_transition_model() = default;
 
     /*!

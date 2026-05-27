@@ -5,31 +5,9 @@
 #include <vector>
 
 #include "../state_transition_model.h"
+#include "laml_data.h"
 
 namespace phylocore {
-
-/*
- * Precomputed per-node values for the LAML model. All quantities are constant
- * for a given branch length, so computing them once here avoids redundant work
- * across characters in the likelihood traversal.
- *
- *   v1 = log(1 - exp(-b))        where b = branch_length
- *   v2 = log(1 - exp(-nu * b))
- */
-struct laml_data {
-    std::vector<double>* buffer;
-    double log_phi;
-    double log_one_minus_phi;
-    double v1;
-    double v2;
-
-    laml_data(std::vector<double>* buffer,
-              double log_phi, double log_one_minus_phi,
-              double v1, double v2)
-        : buffer(buffer), log_phi(log_phi), log_one_minus_phi(log_one_minus_phi),
-          v1(v1), v2(v2) {}
-    laml_data() {}
-};
 
 /*!
  * @brief LAML (Lineage Analysis via Maximum Likelihood) substitution model.

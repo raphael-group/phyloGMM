@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "extern/gcem.hpp"
+#include "constants.h"
 
 /*
  * Set to 1 to enable lookup-table approximations for exp/log.
@@ -65,7 +66,7 @@ log_sum_exp(Iter begin, Iter end) {
     if (begin == end) return VT{};
 
     auto max_val = *std::max_element(begin, end);
-    if (max_val == -std::numeric_limits<VT>::infinity()) return max_val;
+    if (max_val <= NEGATIVE_INFINITY) return max_val;  // finite sentinel; -ffast-math-safe
 
     VT sum{};
     for (auto it = begin; it != end; ++it) {
