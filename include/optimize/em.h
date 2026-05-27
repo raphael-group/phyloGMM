@@ -72,6 +72,10 @@ struct em_options {
  */
 template <typename Problem>
 estimation_results em(Problem& p, em_options opts = {}) {
+    // Guard against overlapping taxa across trees — silent over-weighting of
+    // shared observations in suff_stats would otherwise produce wrong results.
+    p.validate_disjoint_taxa();
+
     // Initial log-likelihood. Also populates the per-tree inside buffer and
     // log_total_likelihood_per_tree_ on the problem (consumed by the edge /
     // outside passes and posterior accessors below).

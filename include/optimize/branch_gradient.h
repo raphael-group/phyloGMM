@@ -23,6 +23,22 @@
 // p(y_c). Summing across sites — and across trees — gives the total tree
 // log-likelihood gradient at edge e.
 //
+// ROOT BRANCH (only used when has_meaningful_root_branch = true):
+// The inside pass applies P(t_root) to the root's inside vector before
+// combining with the root prior π:
+//
+//   p(y_c) = Σ_{i,j} π_i · P(t_root)_{i,j} · exp(inside(c, root, j))
+//
+// Differentiating w.r.t. t_root reuses the same dP/dt = Q · P identity:
+//
+//   d log p(y_c) / d t_root
+//       = Σ_{i,j} π_i · (Q · P(t_root))_{i,j} · exp(inside(c, root, j)) / p(y_c)
+//
+// i.e. the same formula as a non-root edge with M(i) = π_i / p(y_c) playing the
+// role of the outside-times-sibling message (the prior IS the root's "outside",
+// the root has no siblings). Note we use π directly, NOT outside_buffer(root)
+// — outside_buffer(root) has already had P(t_root) pushed up into it.
+//
 // (Q · P(t))_{ab} is evaluated via the cached eigendecomposition Q =
 // U · Λ · U⁻¹:
 //
@@ -50,10 +66,18 @@
 //     for each node v in 0..t->num_nodes-1:
 //       if (v == t->root_id && !problem.stm->has_meaningful_root_branch): skip
 //       append d log_L / d t_v
+//
+// When has_meaningful_root_branch = true, the root branch IS included in the
+// output, at the position dictated by its node_id within the per-tree
+// iteration (typically t.root_id). Callers that pack additional non-branch
+// scalars (e.g. LAML's ν, φ) outside of branch_length_gradient are responsible
+// for splicing this output into the correct slice of their full parameter
+// vector.
 
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -132,18 +156,15 @@ std::vector<double> branch_length_gradient(Problem& problem)
                 continue;
             }
 
-            // The root branch has special semantics (root_prior · P(t_root))
-            // and is not handled by this helper — if a model legitimately
-            // sets has_meaningful_root_branch=true and a user opts in, we
-            // throw early so the failure is loud rather than silently wrong.
-            if (v == t.root_id) {
-                throw std::runtime_error(
-                    "branch_length_gradient: has_meaningful_root_branch=true "
-                    "is not yet supported by the analytic branch gradient");
-            }
+            const bool is_root = (v == t.root_id);
 
-            const std::size_t w  = static_cast<std::size_t>(
-                                       t.tree.predecessors(v)[0]);
+            // Non-root edges read the message arriving at the parent w from
+            // the rest of the tree (outside + sibling edge_inside). The root
+            // branch instead uses the root prior π as its "outside" — there
+            // is no parent and no sibling.
+            const std::size_t w  = is_root
+                ? std::numeric_limits<std::size_t>::max()  // unused for root
+                : static_cast<std::size_t>(t.tree.predecessors(v)[0]);
             const double      te = t.branch_lengths[v];
 
             double accum = 0.0;
@@ -163,12 +184,15 @@ std::vector<double> branch_length_gradient(Problem& problem)
                 }
                 QP = U_Q * diag_term.asDiagonal() * U_Q_inv;
 
-                // log_sib[a] = Σ_{sibling z of v} edge_inside(z, a)
+                // log_sib[a] = Σ_{sibling z of v} edge_inside(z, a). The
+                // root has no siblings, so it stays at 0 in the root case.
                 for (std::size_t a = 0; a < k; ++a) log_sib[a] = 0.0;
-                for (auto sib : t.tree.successors(w)) {
-                    if (static_cast<std::size_t>(sib) == v) continue;
-                    for (std::size_t a = 0; a < k; ++a) {
-                        log_sib[a] += ei_ll(c, sib, a);
+                if (!is_root) {
+                    for (auto sib : t.tree.successors(w)) {
+                        if (static_cast<std::size_t>(sib) == v) continue;
+                        for (std::size_t a = 0; a < k; ++a) {
+                            log_sib[a] += ei_ll(c, sib, a);
+                        }
                     }
                 }
 
@@ -176,17 +200,30 @@ std::vector<double> branch_length_gradient(Problem& problem)
 
                 // Per-site contribution:
                 //   Σ_{a,b} M(a) · Re(QP[a, b]) · I(b) / p(y_c)
-                // where M(a) = exp(outside(w, a) + log_sib(a)) and
-                //       I(b) = exp(inside(v, b)).
+                //
+                // Non-root edge (parent w → child v):
+                //   M(a) = exp(outside(w, a) + log_sib(a))
+                //   I(b) = exp(inside(v, b))
+                //
+                // Root edge (the prior is the root's "outside"):
+                //   M(a) = π_a            (i.e. log M(a) = log π_a)
+                //   I(b) = exp(inside(root, b))
                 //
                 // We absorb the - log p(y_c) into the M-side log so that
                 // every exp() is small in magnitude.
                 double per_site = 0.0;
                 for (std::size_t a = 0; a < k; ++a) {
-                    const double M_a_log = outside_ll(c, w, a)
-                                         + log_sib[a]
-                                         - log_p_y_c;
-                    const double M_a = std::exp(M_a_log);
+                    double M_a;
+                    if (is_root) {
+                        const double pi_a = stm.root_prior[c][a];
+                        if (pi_a <= 0.0) continue;
+                        M_a = pi_a * std::exp(-log_p_y_c);
+                    } else {
+                        const double M_a_log = outside_ll(c, w, a)
+                                             + log_sib[a]
+                                             - log_p_y_c;
+                        M_a = std::exp(M_a_log);
+                    }
                     if (M_a == 0.0) continue;
                     for (std::size_t b = 0; b < k; ++b) {
                         const double I_b = std::exp(inside_ll(c, v, b));

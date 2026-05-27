@@ -171,6 +171,7 @@ add_phylocore_unit_test(test_log_p_y_accessor)
 add_phylocore_unit_test(test_node_posterior_normalization)
 add_phylocore_unit_test(test_inside_likelihood_jc)
 add_phylocore_unit_test(test_pmm_ctmc_inside_likelihood)
+add_phylocore_unit_test(test_disjoint_taxa_check)
 
 # ── phyloGMM random-init characterisation test ───────────────────────────────
 # Tracks EM behaviour under RANDOM init only (no k-means++). The add_phylocore_unit_test
@@ -178,6 +179,23 @@ add_phylocore_unit_test(test_pmm_ctmc_inside_likelihood)
 add_executable(test_random_init_phylo_gmm tests/phylo_gmm/test_random_init_phylo_gmm.cxx)
 target_link_libraries(test_random_init_phylo_gmm PRIVATE phylocore_core)
 add_test(NAME test_random_init_phylo_gmm COMMAND test_random_init_phylo_gmm)
+
+# ── phyloGMM fix_Q / fix_emission / stationary_pi flag-combination test ──────
+# Exercises the conditional logic for the three model-level flags on
+# phylo_gmm_problem (only the defaults are tested elsewhere).
+add_executable(test_phylo_gmm_flags tests/phylo_gmm/test_phylo_gmm_flags.cxx)
+target_link_libraries(test_phylo_gmm_flags PRIVATE phylocore_core)
+add_test(NAME test_phylo_gmm_flags COMMAND test_phylo_gmm_flags)
+
+# ── phyloGMM multi-tree suff_stats aggregation test ──────────────────────────
+# Validates that compute_suff_stats() correctly SUMS per-tree contributions
+# when the problem holds multiple trees. Compares "all trees in one problem"
+# (Way 1) vs "one tree per problem, summed externally" (Way 2). They must
+# agree within 1e-10. Catches loop-bound / indexing / per-tree aggregation
+# bugs in compute_suff_stats and hobolth_jensen_stats.
+add_executable(test_multi_tree_aggregation tests/phylo_gmm/test_multi_tree_aggregation.cxx)
+target_link_libraries(test_multi_tree_aggregation PRIVATE phylocore_core)
+add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:

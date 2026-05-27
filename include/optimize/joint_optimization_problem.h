@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -322,6 +323,35 @@ public:
         double s = 0.0;
         for (double v : log_p_y_per_tree_per_site_[tree_idx]) s += v;
         return s;
+    }
+
+    /*!
+     * @brief Throws std::invalid_argument if any taxa_id appears in more than
+     *        one tree.
+     *
+     * The library's design assumes disjoint taxa_ids across trees — the same
+     * taxon should not appear in multiple trees (since that would mean the
+     * same observation is counted multiple times in suff_stats, producing
+     * silently wrong results). Optimization entry points (optimize::em /
+     * optimize::direct) call this at the top of the main loop to surface the
+     * mistake with a clear message instead of returning garbage.
+     */
+    void validate_disjoint_taxa() const {
+        std::unordered_map<std::size_t, std::size_t> taxa_to_tree;
+        for (std::size_t ti = 0; ti < trees.size(); ++ti) {
+            for (std::size_t v = 0; v < trees[ti]->num_nodes; ++v) {
+                if (trees[ti]->tree.out_degree(static_cast<int>(v)) != 0) continue;  // leaves only
+                const std::size_t taxa_id = trees[ti]->tree[static_cast<int>(v)].data;
+                auto it = taxa_to_tree.find(taxa_id);
+                if (it != taxa_to_tree.end() && it->second != ti) {
+                    throw std::invalid_argument(
+                        "joint_optimization_problem: taxa_id " + std::to_string(taxa_id) +
+                        " appears in trees " + std::to_string(it->second) + " AND " +
+                        std::to_string(ti) + ". Library assumes disjoint taxa across trees.");
+                }
+                taxa_to_tree[taxa_id] = ti;
+            }
+        }
     }
 
 private:

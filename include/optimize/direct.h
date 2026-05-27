@@ -258,6 +258,11 @@ template <typename Problem>
 estimation_results direct(Problem& problem, direct_options opts = {}) {
     using namespace Ipopt;
 
+    // Guard against overlapping taxa across trees — the inside pass would
+    // otherwise double-count the shared observations and produce wrong
+    // likelihoods / gradients without any warning.
+    problem.validate_disjoint_taxa();
+
     SmartPtr<detail::TNLP_adapter<Problem>> adapter =
         new detail::TNLP_adapter<Problem>(problem, opts);
     SmartPtr<TNLP> tnlp = adapter;
