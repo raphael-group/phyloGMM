@@ -770,7 +770,7 @@ restart_record run_em_restart(simulated_dataset& ds,
     else               problem.initialize_random(seed);
 
     phylocore::optimize::em_options opts;
-    opts.tol               = 1e-6;
+    opts.rel_tol           = 1e-5;
     opts.max_iter          = 200;
     opts.verbose           = false;
     opts.warn_on_decrease  = false;  // closed-form M-step + complex eigendecomp

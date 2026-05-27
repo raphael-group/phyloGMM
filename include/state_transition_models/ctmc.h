@@ -34,10 +34,12 @@ namespace phylocore {
  * the paper's assumption of one shared Q across the (single) site. Callers
  * pass site = 0.
  *
- * Only the mandatory scalar primitive compute_log_transition_probability is
- * overridden. has_optimized_functions stays false; the traversal uses the
- * k²-scalar fallback. EM hooks (e_step/m_step) are intentionally not
- * overridden — parameter estimation is a separate, future change.
+ * Both the scalar primitive compute_log_transition_probability and the
+ * optimized matvec compute_log_pmatrix_vector_product are overridden;
+ * build() sets has_optimized_functions = true so the traversal uses the
+ * O(k) matvec path instead of the O(k³) scalar fallback (matters at k >= 4).
+ * EM hooks (e_step/m_step) are intentionally not overridden — parameter
+ * estimation is a separate, future change.
  */
 class ctmc_model : public state_transition_model<> {
 public:
@@ -51,6 +53,18 @@ public:
         double          branch_length,
         size_t          alpha,
         size_t          beta
+    ) const override;
+
+    // Optimised forward/transpose matvec via the cached eigendecomposition.
+    // result[i] = log Σ_j P(t)_{i,j} · exp(log_v[j])         (transpose=false)
+    // result[i] = log Σ_j P(t)_{j,i} · exp(log_v[j])         (transpose=true)
+    void compute_log_pmatrix_vector_product(
+        std::monostate&             data,
+        size_t                      site,
+        double                      branch_length,
+        const std::vector<double>&  log_vector,
+        std::vector<double>&        result,
+        bool                        transpose
     ) const override;
 
     // ── Uniform "of Q" accessors (model-agnostic; shared with reversible) ────

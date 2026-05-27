@@ -32,7 +32,15 @@ namespace optimize {
  * docs/parameter_estimation.md.
  */
 struct em_options {
-    double tol               = 1e-6;
+    // Relative log-L improvement threshold. EM stops when
+    //   (new_llh - prev_llh) / |prev_llh| < rel_tol.
+    // Matches LAML-Pro's convergence criterion (laml_em.cxx:1186). Using a
+    // relative tol scales sensibly with dataset size: tighter for small log-L
+    // problems, looser for large ones. The old absolute-tol default of 1e-6
+    // was equivalent to rel_tol ≈ 1e-6/|log-L|, which became hopelessly tight
+    // for any non-trivial dataset (e.g., 5600× tighter than LAML-Pro on a
+    // 1024-leaf k=4 fixture, where log-L ≈ -558).
+    double rel_tol           = 1e-5;
     int    max_iter          = 100;
     bool   verbose           = false;
 
@@ -123,7 +131,13 @@ estimation_results em(Problem& p, em_options opts = {}) {
                       << "  (delta = " << (new_llh - prev_llh) << ")\n";
         }
 
-        if (std::abs(new_llh - prev_llh) < opts.tol) {
+        // Relative-improvement convergence test, matching LAML-Pro
+        // (laml_em.cxx:1186). prev_llh is finite-negative for any non-trivial
+        // dataset, so |prev_llh| > 0. Also captures non-improving steps
+        // (Δ ≤ 0 < rel_tol) — pure EM should not decrease, and warn_on_decrease
+        // above surfaces it when it does.
+        double rel_delta = (new_llh - prev_llh) / std::abs(prev_llh);
+        if (rel_delta < opts.rel_tol) {
             prev_llh   = new_llh;
             converged  = true;
             break;

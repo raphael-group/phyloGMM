@@ -600,7 +600,7 @@ void print_Sigma(const std::string& label,
 // Common EM options for these tests. max_iter = 50 keeps runtime down.
 phylocore::optimize::em_options test_em_opts() {
     phylocore::optimize::em_options opts;
-    opts.tol               = 1e-6;
+    opts.rel_tol           = 1e-5;
     opts.max_iter          = 50;
     opts.verbose           = false;
     opts.warn_on_decrease  = false;

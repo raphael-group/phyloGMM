@@ -1,5 +1,6 @@
 #include "state_transition_models/ctmc.h"
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <stdexcept>
@@ -67,6 +68,9 @@ void ctmc_model::build() {
     for (size_t i = 0; i < k; ++i)
         for (size_t j = 0; j < k; ++j)
             state_transition_parameters.push_back(Q(i, j));
+
+    // Optimised matvec is implemented below.
+    has_optimized_functions = true;
 }
 
 // ── Scalar primitive ──────────────────────────────────────────────────────────
@@ -93,6 +97,52 @@ double ctmc_model::compute_log_transition_probability(
     }
     double prob = sum.real();
     return (prob > 0.0) ? std::log(prob) : NEGATIVE_INFINITY;
+}
+
+// ── Optimised matvec ──────────────────────────────────────────────────────────
+//
+// Forward:   P(t) · exp(log_v)        via   U · diag(exp(λt)) · U⁻¹ · v
+// Transpose: P(t)ᵀ · exp(log_v)       via   U⁻¹ᵀ · diag(exp(λt)) · Uᵀ · v
+//
+// We subtract max(log_v) before exponentiating to avoid underflow on deep
+// trees and add it back after the log — exploits P(t) · (c·v) = c · P(t)v.
+// Residual imaginary parts cancel exactly in exact arithmetic; we take .real()
+// and clamp non-positive entries to NEGATIVE_INFINITY.
+
+void ctmc_model::compute_log_pmatrix_vector_product(
+    std::monostate& /*data*/,
+    size_t /*site*/,
+    double branch_length,
+    const std::vector<double>& log_vector,
+    std::vector<double>& result,
+    bool transpose
+) const {
+    const Eigen::Index k = cache.lambda.size();
+
+    double max_log = *std::max_element(log_vector.begin(),
+                                       log_vector.begin() + k);
+
+    Eigen::VectorXcd v(k);
+    for (Eigen::Index i = 0; i < k; ++i)
+        v[i] = std::exp(log_vector[i] - max_log);
+
+    // First multiply: U_inv·v (forward) or U.transpose()·v (transpose).
+    Eigen::VectorXcd w = transpose
+                       ? (cache.U.transpose() * v).eval()
+                       : (cache.U_inv * v).eval();
+
+    // Apply diag(exp(λ_p · t)).
+    for (Eigen::Index p = 0; p < k; ++p)
+        w[p] *= std::exp(cache.lambda[p] * branch_length);
+
+    // Second multiply: U·w (forward) or U_inv.transpose()·w (transpose).
+    Eigen::VectorXd res = transpose
+                        ? (cache.U_inv.transpose() * w).real().eval()
+                        : (cache.U * w).real().eval();
+
+    for (Eigen::Index i = 0; i < k; ++i)
+        result[i] = (res[i] > 0.0) ? std::log(res[i]) + max_log
+                                   : NEGATIVE_INFINITY;
 }
 
 } // namespace phylocore
