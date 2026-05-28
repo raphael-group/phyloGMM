@@ -190,7 +190,7 @@ add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 # ── Topology search unit tests ───────────────────────────────────────────────
 add_executable(test_topology_search
     tests/topology_search/test_topology_search.cxx)
-target_link_libraries(test_topology_search PRIVATE phylocore_core)
+target_link_libraries(test_topology_search PRIVATE phylocore_core PkgConfig::IPOPT)
 add_test(NAME test_topology_search COMMAND test_topology_search)
 
 # ── Python bindings (optional) ────────────────────────────────────────────────

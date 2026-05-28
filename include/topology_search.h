@@ -37,9 +37,37 @@
 #include <vector>
 
 #include "phylogeny.h"
+#include "optimize/direct.h"
+#include "optimize/em.h"
 
 namespace phylocore {
 namespace topology_search {
+
+// ── Optimizer dispatch ────────────────────────────────────────────────────────
+
+/*!
+ * @brief Selects which parameter optimizer to invoke during topology scoring.
+ *
+ * none   — skip parameter re-fitting (default; no IPOPT dependency).
+ * direct — call optimize::direct (IPOPT required at link time).
+ * em     — call optimize::em (M-step must be implemented by Problem).
+ */
+enum class optimizer_type { none, direct, em };
+
+namespace detail {
+
+template <optimizer_type Opt, typename Problem>
+void run_optimizer(Problem& p)
+{
+    if constexpr (Opt == optimizer_type::direct) {
+        optimize::direct(p);
+    } else if constexpr (Opt == optimizer_type::em) {
+        optimize::em(p);
+    }
+    // optimizer_type::none: no-op; discarded branches are never instantiated
+}
+
+} // namespace detail
 
 // ── NNI ──────────────────────────────────────────────────────────────────────
 
@@ -249,14 +277,25 @@ struct search_strategy_options {
  *
  * @tparam Problem  Any type satisfying the protocol in the file header.
  */
-template <typename Problem>
+template <optimizer_type Opt = optimizer_type::none, typename Problem>
 double score_nni_move(tree t, const nni& move, Problem& p)
 {
     apply_nni(t, move);
-    tree* orig   = p.trees[0];
-    p.trees[0]   = &t;
+    tree* orig = p.trees[0];
+    p.trees[0] = &t;
+
+    std::vector<double> saved_params;
+    if constexpr (Opt != optimizer_type::none) {
+        saved_params = p.get_params();
+        detail::run_optimizer<Opt>(p);
+    }
+
     double score = p.log_likelihood();
-    p.trees[0]   = orig;
+
+    p.trees[0] = orig;
+    if constexpr (Opt != optimizer_type::none)
+        p.set_params(saved_params);
+
     return score;
 }
 
@@ -268,13 +307,21 @@ double score_nni_move(tree t, const nni& move, Problem& p)
  * best move; best_tree in the result is a separate copy with the best move
  * applied.
  */
-template <typename Problem>
+template <optimizer_type Opt = optimizer_type::none, typename Problem>
 topology_evaluation_result score_nni_neighborhood(tree t, Problem& p)
 {
-    tree* orig        = p.trees[0];
-    p.trees[0]        = &t;
+    tree* orig = p.trees[0];
+    p.trees[0] = &t;
+
+    std::vector<double> saved_params;
+    if constexpr (Opt != optimizer_type::none) {
+        saved_params = p.get_params();
+        detail::run_optimizer<Opt>(p);
+    }
     double current_ll = p.log_likelihood();
-    p.trees[0]        = orig;
+    p.trees[0] = orig;
+    if constexpr (Opt != optimizer_type::none)
+        p.set_params(saved_params);
 
     auto moves = compute_nni_neighborhood(t);
 
@@ -288,8 +335,7 @@ topology_evaluation_result score_nni_neighborhood(tree t, Problem& p)
     bool found_better = false;
 
     for (const auto& m : moves) {
-        // score_nni_move takes t by value — copies t, applies move, discards
-        double score = score_nni_move(t, m, p);
+        double score = score_nni_move<Opt>(t, m, p);
         result.log_likelihoods.push_back(score);
         if (score > result.log_likelihood) {
             result.log_likelihood = score;
@@ -299,7 +345,7 @@ topology_evaluation_result score_nni_neighborhood(tree t, Problem& p)
     }
 
     if (found_better) {
-        result.best_tree = t;  // t was never mutated during the loop
+        result.best_tree = t;
         apply_nni(result.best_tree, best_move);
     }
 
@@ -313,14 +359,25 @@ topology_evaluation_result score_nni_neighborhood(tree t, Problem& p)
  * p.trees[0] is temporarily redirected to &t for the log_likelihood() call
  * and restored before returning.
  */
-template <typename Problem>
+template <optimizer_type Opt = optimizer_type::none, typename Problem>
 double score_spr_move(tree t, const spr& move, Problem& p)
 {
     apply_spr(t, move);
-    tree* orig   = p.trees[0];
-    p.trees[0]   = &t;
+    tree* orig = p.trees[0];
+    p.trees[0] = &t;
+
+    std::vector<double> saved_params;
+    if constexpr (Opt != optimizer_type::none) {
+        saved_params = p.get_params();
+        detail::run_optimizer<Opt>(p);
+    }
+
     double score = p.log_likelihood();
-    p.trees[0]   = orig;
+
+    p.trees[0] = orig;
+    if constexpr (Opt != optimizer_type::none)
+        p.set_params(saved_params);
+
     return score;
 }
 
@@ -334,7 +391,7 @@ double score_spr_move(tree t, const spr& move, Problem& p)
  *
  * @tparam Problem  Must satisfy the protocol in the file header.
  */
-template <typename Problem>
+template <optimizer_type Opt = optimizer_type::none, typename Problem>
 topology_evaluation_result hill_climbing(Problem& p,
                                          search_strategy_options opts = {})
 {
@@ -347,10 +404,12 @@ topology_evaluation_result hill_climbing(Problem& p,
     result.log_likelihoods.push_back(current_ll);
 
     for (int iter = 0; iter < opts.max_iter; ++iter) {
-        auto nbr = score_nni_neighborhood(current_tree, p);
+        auto nbr = score_nni_neighborhood<Opt>(current_tree, p);
         if (nbr.log_likelihood > current_ll) {
-            current_tree          = nbr.best_tree;
-            current_ll            = nbr.log_likelihood;
+            current_tree = nbr.best_tree;
+            current_ll   = nbr.log_likelihood;
+            // params were restored after scoring; permanently refit on accepted topology
+            detail::run_optimizer<Opt>(p);
             result.best_tree      = current_tree;
             result.log_likelihood = current_ll;
             result.log_likelihoods.push_back(current_ll);
@@ -377,7 +436,7 @@ topology_evaluation_result hill_climbing(Problem& p,
  * @tparam Problem  Must satisfy the protocol in the file header (including
  *                  get_params() and set_params()).
  */
-template <typename Problem>
+template <optimizer_type Opt = optimizer_type::none, typename Problem>
 topology_evaluation_result simulated_annealing(Problem& p,
                                                search_strategy_options opts = {})
 {
@@ -404,10 +463,12 @@ topology_evaluation_result simulated_annealing(Problem& p,
         std::discrete_distribution<> sampler(weights.begin(), weights.end());
         nni sampled_move = neighborhood[sampler(gen)];
 
+        // save pre-move, pre-optimize state for rollback on rejection
         auto saved_blens  = current_tree.branch_lengths;
         auto saved_params = p.get_params();
 
-        auto [pu, pv]  = apply_nni(current_tree, sampled_move);
+        auto [pu, pv] = apply_nni(current_tree, sampled_move);
+        detail::run_optimizer<Opt>(p);   // no-op when Opt == none
         double move_ll = p.log_likelihood();
         double delta   = move_ll - current_ll;
 
@@ -417,10 +478,11 @@ topology_evaluation_result simulated_annealing(Problem& p,
         if (delta > 0.0 || proposal > uni(gen)) {
             current_ll = move_ll;
             ++no_accepts;
+            // optimized params stay — move accepted
         } else {
             revert_nni(current_tree, sampled_move, pu, pv);
             current_tree.branch_lengths = std::move(saved_blens);
-            p.set_params(saved_params);
+            p.set_params(saved_params);  // restore pre-move params — move rejected
         }
 
         log_likelihoods.push_back(current_ll);
