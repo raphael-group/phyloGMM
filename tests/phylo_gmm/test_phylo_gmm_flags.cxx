@@ -847,6 +847,16 @@ scenario_result test_fix_both(simulated_dataset& ds, const ground_truth& gt) {
     b->problem.initialize_kmeans_pp(1000u);
     seed_truth(*b, gt);
 
+    // seed_truth installs root_prior = gt.pi, which is not necessarily the
+    // stationary distribution of gt.Q. With stationary_pi=true, EM will
+    // recompute root_prior from gt.Q's stationary on iter 1, so pi_initial
+    // must already be that stationary or the "pi_final == pi_initial"
+    // invariant becomes a one-step-correction observation, not drift.
+    {
+        Eigen::VectorXd pi = b->problem.extract_stationary_pi_();
+        b->problem.set_pi_on_root_prior_(pi);
+    }
+
     const Eigen::MatrixXd Q_initial = b->stm.Q;
     const auto mu_initial    = b->obs.mu;
     const auto Sigma_initial = b->obs.Sigma;

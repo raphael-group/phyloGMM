@@ -677,6 +677,127 @@ void dump_vec(std::ostream& os, const Eigen::VectorXd& v) {
     os << "]";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Posterior extraction for the best restart
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct posterior_outputs {
+    // N_leaves × K, indexed by taxa_id (= leaf vertex .data, 0..N_leaves-1).
+    // Rows are normalized probabilities (sum to 1).
+    std::vector<std::vector<double>> leaf_posteriors;
+    std::vector<int>                  leaf_labels;          // argmax per row
+
+    // N_internal × K, internal_posteriors[r] corresponds to phylogeny node
+    // internal_node_ids[r]. Callers MUST use internal_node_ids to map rows
+    // back to tree nodes — internal nodes have no taxa_id.
+    std::vector<std::vector<double>> internal_posteriors;
+    std::vector<int>                  internal_node_ids;
+
+    Eigen::MatrixXd expected_transitions;  // K × K, hj.N_total
+    Eigen::VectorXd expected_dwell_times;  // K,     hj.T_total
+};
+
+// Rebuilds a fresh problem with the best restart's params, runs one E-step
+// pass (inside + edge_inside + outside), then extracts node-level posteriors
+// and Hobolth-Jensen aggregate. Cost: one EM iteration's worth of work.
+posterior_outputs compute_posteriors(
+    tree&                          t,
+    std::vector<Eigen::VectorXd>& observed_data,
+    meta_data&                    metadata,
+    std::size_t                    k,
+    std::size_t                    d,
+    bool                           fix_pi,
+    const restart_record&         best)
+{
+    ctmc_model stm;
+    stm.Q = best.Q;
+    // Pre-install π as root_prior so ctmc_model::build() doesn't overwrite it
+    // with uniform (its empty-or-wrong-size fallback).
+    {
+        std::vector<double> pi_v(k);
+        for (std::size_t i = 0; i < k; ++i)
+            pi_v[i] = best.pi[static_cast<Eigen::Index>(i)];
+        stm.root_prior = { pi_v };
+    }
+    stm.build();
+
+    gmm_observation_model obs;
+    obs.d     = d;
+    obs.mu    = best.mu;
+    obs.Sigma = best.Sigma;
+    obs.sites_latent_states = stm.sites_latent_states;
+    obs.build();
+
+    std::vector<std::monostate> nd(t.num_nodes, std::monostate{});
+
+    phylo_gmm_problem prob;
+    prob.stm           = &stm;
+    prob.obs           = &obs;
+    prob.observed_data = &observed_data;
+    prob.metadata      = &metadata;
+    prob.trees.push_back(&t);
+    prob.node_data.push_back(&nd);
+    prob.stationary_pi = !fix_pi;
+
+    // E-step pass at the best params.
+    (void)prob.log_likelihood();
+    phylocore::compute_edge_inside_log_likelihood(
+        stm, t,
+        prob.inside_buffer(0), prob.edge_inside_buffer(0), nd);
+    phylocore::compute_outside_log_likelihood(
+        stm, t,
+        prob.edge_inside_buffer(0), prob.outside_buffer(0), nd);
+
+    posterior_outputs out;
+    out.leaf_posteriors.assign(t.num_leaves, std::vector<double>(k, 0.0));
+    out.leaf_labels.assign(t.num_leaves, 0);
+    out.internal_posteriors.reserve(t.num_nodes - t.num_leaves);
+    out.internal_node_ids.reserve(t.num_nodes - t.num_leaves);
+
+    for (int v : t.tree.nodes()) {
+        const bool is_leaf = (t.tree.out_degree(v) == 0);
+        auto log_gamma = prob.node_posterior(0, static_cast<std::size_t>(v), 0);
+
+        // exp + normalize. Subtract max first to avoid underflow on deep trees.
+        double m = log_gamma[0];
+        for (std::size_t i = 1; i < k; ++i)
+            if (log_gamma[i] > m) m = log_gamma[i];
+
+        std::vector<double> probs(k);
+        double s = 0.0;
+        for (std::size_t i = 0; i < k; ++i) {
+            probs[i] = std::exp(log_gamma[i] - m);
+            s += probs[i];
+        }
+        if (s > 0.0) {
+            for (auto& p : probs) p /= s;
+        } else {
+            // Defensive: degenerate node (shouldn't happen on a converged
+            // model). Fall through to uniform 1/k so rows still sum to 1.
+            for (auto& p : probs) p = 1.0 / static_cast<double>(k);
+        }
+
+        int label = 0;
+        for (std::size_t i = 1; i < k; ++i)
+            if (probs[i] > probs[label]) label = static_cast<int>(i);
+
+        if (is_leaf) {
+            const std::size_t taxa_id =
+                static_cast<std::size_t>(t.tree[v].data);
+            out.leaf_posteriors[taxa_id] = std::move(probs);
+            out.leaf_labels[taxa_id]     = label;
+        } else {
+            out.internal_posteriors.push_back(std::move(probs));
+            out.internal_node_ids.push_back(v);
+        }
+    }
+
+    auto hj = phylocore::optimize::hobolth_jensen_stats(prob);
+    out.expected_transitions = hj.N_total;
+    out.expected_dwell_times = hj.T_total;
+    return out;
+}
+
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -815,6 +936,9 @@ int main(int argc, char* argv[]) {
     std::cerr << "\nBest: " << best->label << " seed=" << best->seed
               << " log L = " << best->log_likelihood << "\n";
 
+    // ── Posterior extraction at best params (one extra E-step pass) ────────
+    auto post = compute_posteriors(t, observed_data, metadata, k, d, fix_pi, *best);
+
     // ── JSON output ────────────────────────────────────────────────────────
     std::cout.precision(10);
     std::cout << "{\n";
@@ -846,8 +970,63 @@ int main(int argc, char* argv[]) {
     dump_vec(std::cout, best->pi);
     std::cout << ",\n";
 
-    // Extra: per-restart log-L list, plus convergence flag — supports the
-    // success-rate diff that's the headline metric of Task #33.
+    // ── Per-leaf + internal-node posteriors (normalized probabilities) ────
+    // Row order for "posteriors" / "leaf_labels" matches "leaf_names" (which
+    // matches taxa_id ordering). Internal-node rows are unordered w.r.t. the
+    // tree; callers must use "internal_node_ids" to map row → phylogeny node.
+    std::cout << "  \"leaf_names\": [";
+    for (std::size_t i = 0; i < metadata.taxa_names.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << "\"" << metadata.taxa_names[i] << "\"";
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"posteriors\": [";
+    for (std::size_t i = 0; i < post.leaf_posteriors.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << "[";
+        for (std::size_t j = 0; j < k; ++j) {
+            if (j > 0) std::cout << ", ";
+            std::cout << post.leaf_posteriors[i][j];
+        }
+        std::cout << "]";
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"leaf_labels\": [";
+    for (std::size_t i = 0; i < post.leaf_labels.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << post.leaf_labels[i];
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"internal_node_posteriors\": [";
+    for (std::size_t i = 0; i < post.internal_posteriors.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << "[";
+        for (std::size_t j = 0; j < k; ++j) {
+            if (j > 0) std::cout << ", ";
+            std::cout << post.internal_posteriors[i][j];
+        }
+        std::cout << "]";
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"internal_node_ids\": [";
+    for (std::size_t i = 0; i < post.internal_node_ids.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << post.internal_node_ids[i];
+    }
+    std::cout << "],\n";
+
+    std::cout << "  \"expected_transitions\": ";
+    dump_matrix(std::cout, post.expected_transitions);
+    std::cout << ",\n";
+
+    std::cout << "  \"expected_dwell_times\": ";
+    dump_vec(std::cout, post.expected_dwell_times);
+    std::cout << ",\n";
+
     std::cout << "  \"per_restart\": [\n";
     for (std::size_t i = 0; i < records.size(); ++i) {
         const auto& r = records[i];

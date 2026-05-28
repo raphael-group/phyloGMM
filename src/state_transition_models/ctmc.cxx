@@ -1,6 +1,7 @@
 #include "state_transition_models/ctmc.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <stdexcept>
@@ -118,6 +119,8 @@ void ctmc_model::compute_log_pmatrix_vector_product(
     bool transpose
 ) const {
     const Eigen::Index k = cache.lambda.size();
+    assert(log_vector.size() >= static_cast<std::size_t>(k));
+    assert(result.size()     >= static_cast<std::size_t>(k));
 
     double max_log = *std::max_element(log_vector.begin(),
                                        log_vector.begin() + k);
