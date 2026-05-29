@@ -30,12 +30,14 @@
  */
 
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <queue>
 #include <random>
 #include <unordered_set>
 #include <vector>
 
+#include "io.h"
 #include "phylogeny.h"
 #include "optimize/direct.h"
 #include "optimize/em.h"
@@ -264,6 +266,7 @@ struct search_strategy_options {
     double min_branch_length = 1e-6;
     double initial_phi       = 1.0;
     double initial_nu        = 1.0;
+    bool   verbose           = false;
 };
 
 // ── Topology scoring ──────────────────────────────────────────────────────────
@@ -479,10 +482,25 @@ topology_evaluation_result simulated_annealing(Problem& p,
             current_ll = move_ll;
             ++no_accepts;
             // optimized params stay — move accepted
+            if (opts.verbose) {
+                std::cerr << "[SA iter " << iteration << "] ACCEPT"
+                          << "  delta=" << delta
+                          << "  ll=" << current_ll
+                          << "  T=" << T
+                          << "  tree=" << write_newick_tree(current_tree)
+                          << "\n";
+            }
         } else {
             revert_nni(current_tree, sampled_move, pu, pv);
             current_tree.branch_lengths = std::move(saved_blens);
             p.set_params(saved_params);  // restore pre-move params — move rejected
+            if (opts.verbose) {
+                std::cerr << "[SA iter " << iteration << "] REJECT"
+                          << "  delta=" << delta
+                          << "  ll=" << current_ll
+                          << "  T=" << T
+                          << "\n";
+            }
         }
 
         log_likelihoods.push_back(current_ll);
