@@ -36,7 +36,9 @@ add_library(phylocore_core STATIC
     src/io.cxx
     src/state_transition_models/reversible_ctmc.cxx
     src/state_transition_models/ctmc.cxx
+    src/state_transition_models/melt.cxx
     src/observation_models/gmm.cxx
+    src/observation_models/melt.cxx
     # src/state_transition_models/laml.cxx              # disabled: pending migration (Task #9)
 )
 
@@ -82,6 +84,16 @@ target_compile_definitions(run_gtr_em
 add_executable(run_gtr_example src/run_gtr_example.cxx)
 target_link_libraries(run_gtr_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
 target_compile_definitions(run_gtr_example
+    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+# ── Driver: run_melt_example ─────────────────────────────────────────────────
+# MELT model smoke test: SA (optimizer_type::none) on an 8-taxon / 100-site
+# simulated dataset. Ground-truth parameters, topology perturbed by 2 NNIs.
+# No IPOPT dependency (optimizer_type::none).
+add_executable(run_melt_example src/run_melt_example.cxx)
+target_link_libraries(run_melt_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
+target_compile_definitions(run_melt_example
     PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -196,6 +208,11 @@ add_test(NAME test_phylo_gmm_flags COMMAND test_phylo_gmm_flags)
 add_executable(test_multi_tree_aggregation tests/phylo_gmm/test_multi_tree_aggregation.cxx)
 target_link_libraries(test_multi_tree_aggregation PRIVATE phylocore_core)
 add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
+
+# ── MeLT likelihood tests ────────────────────────────────────────────────────
+add_executable(test_melt_ctmc tests/melt/test_melt_ctmc.cxx)
+target_link_libraries(test_melt_ctmc PRIVATE phylocore_core)
+add_test(NAME test_melt_ctmc COMMAND test_melt_ctmc)
 
 # ── Topology search unit tests ───────────────────────────────────────────────
 add_executable(test_topology_search
