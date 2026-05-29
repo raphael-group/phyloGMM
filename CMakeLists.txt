@@ -75,6 +75,16 @@ target_compile_definitions(run_gtr_em
     PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
+# ── Driver: run_gtr_example ──────────────────────────────────────────────────
+# GTR EM + simulated annealing: warms up parameters with EM on the starting
+# topology, then runs SA with EM re-fitting at each NNI proposal. Header-only
+# EM — no IPOPT dependency.
+add_executable(run_gtr_example src/run_gtr_example.cxx)
+target_link_libraries(run_gtr_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
+target_compile_definitions(run_gtr_example
+    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
 # ── Driver: run_phylo_gmm ────────────────────────────────────────────────────
 # phyloGMM EM driver on real data (Newick tree + CSV observations). Closed-form
 # M-step (Mode #5) — no IPOPT dependency. Synthetic-data coverage is provided
