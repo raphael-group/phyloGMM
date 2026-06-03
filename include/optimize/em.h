@@ -131,13 +131,17 @@ estimation_results em(Problem& p, em_options opts = {}) {
                       << "  (delta = " << (new_llh - prev_llh) << ")\n";
         }
 
-        // Relative-improvement convergence test, matching LAML-Pro
-        // (laml_em.cxx:1186). prev_llh is finite-negative for any non-trivial
-        // dataset, so |prev_llh| > 0. Also captures non-improving steps
-        // (Δ ≤ 0 < rel_tol) — pure EM should not decrease, and warn_on_decrease
-        // above surfaces it when it does.
+        // Relative-improvement convergence test. prev_llh is finite-negative
+        // for any non-trivial dataset, so |prev_llh| > 0. We require a
+        // *non-negative* improvement smaller than rel_tol — i.e. the iterate
+        // genuinely plateaued. Non-positive deltas keep iterating (with
+        // warn_on_decrease above surfacing the regression) until either a
+        // genuine plateau or max_iter caps the loop. The earlier behaviour
+        // (rel_delta < rel_tol for any sign) silently declared early-stop on
+        // the first step that overshot, producing fits that were not at a
+        // local optimum.
         double rel_delta = (new_llh - prev_llh) / std::abs(prev_llh);
-        if (rel_delta < opts.rel_tol) {
+        if (rel_delta >= 0.0 && rel_delta < opts.rel_tol) {
             prev_llh   = new_llh;
             converged  = true;
             break;

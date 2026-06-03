@@ -108,7 +108,6 @@ std::vector<double> compute_inside_log_likelihood(
     likelihood_buffer& b,
     std::vector<D>& node_data
 ) {
-    (void)metadata; // currently unused inside the traversal; threaded through for downstream consumers
     size_t num_sites = state_transition_model.sites_latent_states.size();
     size_t max_alpha = std::max_element(
         state_transition_model.sites_latent_states.begin(),
@@ -127,6 +126,22 @@ std::vector<double> compute_inside_log_likelihood(
                 for (size_t j = 0; j < alpha; ++j)
                     b(c, node_id, j) = obs_model.compute_log_emission_probability(
                         node_data[node_id], j, c, obs);
+                // Hard-label clamp (no-op when metadata.hard_labels is empty).
+                // When set, force the leaf's inside likelihood to a delta at
+                // hard_labels[taxa_id]. The conditional distribution propagates
+                // to internal nodes via the postorder pass below.
+                if (!metadata.hard_labels.empty()
+                    && taxa_id < metadata.hard_labels.size())
+                {
+                    const int j_star = metadata.hard_labels[taxa_id];
+                    if (j_star >= 0) {
+                        for (size_t j = 0; j < alpha; ++j) {
+                            b(c, node_id, j) =
+                                (static_cast<int>(j) == j_star)
+                                    ? 0.0 : NEGATIVE_INFINITY;
+                        }
+                    }
+                }
                 continue;
             }
             for (size_t j = 0; j < alpha; ++j) b(c, node_id, j) = 0.0;
@@ -218,13 +233,23 @@ void compute_outside_log_likelihood(
     for (size_t u_id : t.tree.preorder_traversal(t.root_id)) {
         if (t.tree.in_degree(u_id) == 0) continue;
         size_t w_id = t.tree.predecessors(u_id)[0];
-        size_t v_id = t.tree.successors(w_id)[0];
-        if (v_id == u_id) v_id = t.tree.successors(w_id)[1];
 
         for (size_t c = 0; c < num_sites; ++c) {
             size_t alpha = state_transition_model.sites_latent_states[c].alphabet_size;
-            for (size_t j = 0; j < alpha; ++j)
-                tmp1[j] = edge_inside_ll(c, v_id, j) + b(c, w_id, j);
+            // outside(u) ∝ sum_{state_w} T(state_u | state_w) · outside(w, state_w)
+            //                · product_{sib of u} edge_inside(sib, state_w)
+            // Start with outside(w), then in log-space add every sibling's
+            // edge_inside contribution. Works for any arity at w (unary,
+            // binary, multifurcating). The previous implementation hard-coded
+            // exactly two children and read successors(w)[1] when w had only
+            // one — undefined behaviour on unary internal nodes (notably the
+            // unary roots emitted by some simulators and ete3 NHX trees).
+            for (size_t j = 0; j < alpha; ++j) tmp1[j] = b(c, w_id, j);
+            for (int sib_id : t.tree.successors(w_id)) {
+                if (static_cast<size_t>(sib_id) == u_id) continue;
+                for (size_t j = 0; j < alpha; ++j)
+                    tmp1[j] += edge_inside_ll(c, sib_id, j);
+            }
             apply_log_transition(
                 state_transition_model, node_data[u_id], c, t.branch_lengths[u_id],
                 tmp1, tmp2, log_terms, /*transpose=*/true);
