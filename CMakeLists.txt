@@ -210,9 +210,12 @@ target_link_libraries(test_multi_tree_aggregation PRIVATE phylocore_core)
 add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 
 # ── MeLT likelihood tests ────────────────────────────────────────────────────
-add_executable(test_melt_ctmc tests/melt/test_melt_ctmc.cxx)
-target_link_libraries(test_melt_ctmc PRIVATE phylocore_core)
-add_test(NAME test_melt_ctmc COMMAND test_melt_ctmc)
+# NOTE: tests/melt/test_melt_ctmc.cxx is referenced by Akhil's upstream commit
+# 5c1af7d but the source file was never committed. Local workaround: skip the
+# target until the file lands upstream. Revert this hunk after that.
+# add_executable(test_melt_ctmc tests/melt/test_melt_ctmc.cxx)
+# target_link_libraries(test_melt_ctmc PRIVATE phylocore_core)
+# add_test(NAME test_melt_ctmc COMMAND test_melt_ctmc)
 
 # ── Topology search unit tests ───────────────────────────────────────────────
 add_executable(test_topology_search

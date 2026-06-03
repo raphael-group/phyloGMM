@@ -22,6 +22,17 @@ struct meta_data {
     // Real per-site alphabet sizes; may be heterogeneous across sites.
     std::vector<size_t>      alphabet_sizes;
     std::vector<std::string> taxa_names;
+
+    // Optional per-leaf hard labels indexed by taxa_id (= leaf node.data).
+    // Empty → no clamping anywhere. When non-empty:
+    //   hard_labels[taxa_id] == -1   → leaf is unclamped (normal emission)
+    //   hard_labels[taxa_id] >=  0   → inside_buffer at this leaf is forced to
+    //                                  log P(X_leaf = j) = 0  if j == label
+    //                                                    = -inf otherwise
+    // The clamp is applied during compute_inside_log_likelihood at the leaf
+    // branch. Downstream passes (edge_inside, outside, Hobolth-Jensen suff
+    // stats, node/leaf posteriors) propagate it automatically.
+    std::vector<int>         hard_labels;
 };
 
 } // namespace phylocore
