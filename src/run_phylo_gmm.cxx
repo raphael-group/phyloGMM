@@ -1175,9 +1175,16 @@ void print_usage(const char* prog) {
       "\n"
       "Usage (joint inference / mode selection, flag-based):\n"
       "  " << prog << " --k K [--max_iter N] [--tol T] [--q_init_rate R] \\\n"
-      "                [--fix_pi 0|1] [--n_init N] \\\n"
+      "                [--pi_mode stationary|free] [--n_init N] \\\n"
       "                --tree T1 --obs O1 [--tree T2 --obs O2 ...] \\\n"
       "                [mode flag]\n"
+      "\n"
+      "Pi mode (default 'stationary'):\n"
+      "  --pi_mode stationary    pi = stationary distribution of Q, recomputed\n"
+      "                          after every Q update. NOT a free EM parameter.\n"
+      "  --pi_mode free          pi initialized uniformly, then freely fit each\n"
+      "                          M-step from the root posteriors.\n"
+      "  --fix_pi 0|1            DEPRECATED alias. 0==stationary, 1==free.\n"
       "\n"
       "Mode flags (at most one of the first three, plus optional --fix_emission):\n"
       "  --fix_q <rate>          Q held at uniform-exit-rate matrix; EM on μ, Σ, π\n"
@@ -1236,7 +1243,22 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--max_iter")          a.max_iter    = std::stoi(next());
             else if (s == "--tol")               a.tol         = std::stod(next());
             else if (s == "--q_init_rate")       a.q_init_rate = std::stod(next());
-            else if (s == "--fix_pi")            a.fix_pi      = std::stoi(next()) != 0;
+            else if (s == "--pi_mode") {
+                std::string m = next();
+                if      (m == "stationary") a.fix_pi = false;
+                else if (m == "free")       a.fix_pi = true;
+                else throw std::runtime_error(
+                    "--pi_mode must be 'stationary' (pi = stationary(Q)) "
+                    "or 'free' (pi fit from root posteriors via M-step). "
+                    "Got: '" + m + "'");
+            }
+            else if (s == "--fix_pi") {
+                std::cerr << "warning: --fix_pi is deprecated; use "
+                             "--pi_mode {stationary,free}. "
+                             "--fix_pi 0 == --pi_mode stationary, "
+                             "--fix_pi 1 == --pi_mode free.\n";
+                a.fix_pi = std::stoi(next()) != 0;
+            }
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
             else if (s == "--fix_emission")      a.fix_emission     = true;
             else if (s == "--fix_q")             a.fix_q_rate       = std::stod(next());
