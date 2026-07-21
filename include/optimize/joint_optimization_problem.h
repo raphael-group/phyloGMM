@@ -129,6 +129,12 @@ public:
      */
     virtual void set_params(const std::vector<double>& params) = 0;
 
+    /*!
+     * @brief Multiplier applied to each leaf log-emission in the inside
+     *        traversal. The default 1.0 gives the ordinary likelihood.
+     */
+    virtual double emission_log_weight() const { return 1.0; }
+
     // ── OPTIONAL overrides (library defaults) ────────────────────────────────
 
     /*!
@@ -148,7 +154,8 @@ public:
         for (std::size_t i = 0; i < trees.size(); ++i) {
             auto per_site = phylocore::compute_inside_log_likelihood(
                 *stm, *obs, *observed_data, *metadata,
-                *trees[i], *inside_buffers_[i], *node_data[i]);
+                *trees[i], *inside_buffers_[i], *node_data[i],
+                emission_log_weight());
             for (double v : per_site) total += v;
             log_p_y_per_tree_per_site_[i] = std::move(per_site);
         }

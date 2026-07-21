@@ -24,8 +24,9 @@
 // λ_p → λ_q.
 //
 // This helper is templated on the scalar type deduced from the model's
-// eigendecomposition of Q (real for reversible_ctmc_model, complex for the
-// general ctmc_model). With Q = U_Q · diag(λ_Q) · U_Q⁻¹:
+// active branch operator (real for reversible_ctmc_model, complex for the
+// general ctmc_model). Ordinarily that operator is Q. A powered complete-path
+// CTMC instead exposes B_ii=w_C Q_ii and B_ij=Q_ij^w_C through the same API.
 //
 //   W_e[a,b] = exp(outside(parent, a) + sibling_edge_inside(a)
 //                 + inside(child, b) − log p(y))
@@ -34,7 +35,7 @@
 //   C        = (U_Q⁻¹)ᵀ · H · U_Qᵀ
 //
 //   E[T_i  | y]_e  = C[i, i]
-//   E[N_ij | y]_e  = Q_ij · C[i, j]    (i ≠ j)
+//   E[N_ij | y]_e  = B_ij · C[i, j]    (i ≠ j)
 //
 // For reversible models the symmetric similarity transform A = D·Q·D⁻¹ has
 // orthogonal eigenvectors U_A, and U_Q = D⁻¹·U_A, U_Q⁻¹ = U_Aᵀ·D, λ_Q = λ_A,
@@ -193,17 +194,17 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
             const VecT& lambda  = stm.eigenvalues_q(c);
             const MatT& U_Q_inv = stm.inverse_eigenvectors_q(c);
 
-            // Q[i, j] = (U_Q · diag(λ) · U_Q⁻¹)[i, j]. For reversible models
-            // this is a real matrix; for general ctmc_model the imaginary
-            // parts cancel modulo numerical noise. We always materialize a
-            // real Q so we can multiply it cleanly against the (real)
+            // Materialize the active branch operator B. For ordinary models
+            // B=Q; weighted complete-path CTMC models expose their powered
+            // operator here. Imaginary parts cancel modulo numerical noise.
+            // We use a real matrix so it multiplies cleanly against the
             // N_total aggregate later. The product is k×k → O(k^3),
             // negligible for typical k.
-            MatT Q_typed = U_Q * lambda.asDiagonal() * U_Q_inv;
-            Eigen::MatrixXd Q(k, k);
+            MatT B_typed = U_Q * lambda.asDiagonal() * U_Q_inv;
+            Eigen::MatrixXd B(k, k);
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t j = 0; j < k; ++j)
-                    Q(i, j) = to_real(Q_typed(i, j));
+                    B(i, j) = to_real(B_typed(i, j));
 
             const double log_p_y = problem.log_p_y(ti, c);
 
@@ -262,7 +263,7 @@ hobolth_jensen_aggregate hobolth_jensen_stats(Problem& problem)
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t j = 0; j < k; ++j)
                     if (i != j)
-                        agg.N_total(i, j) += Q(i, j) * to_real(C(i, j));
+                        agg.N_total(i, j) += B(i, j) * to_real(C(i, j));
         }
     }
 

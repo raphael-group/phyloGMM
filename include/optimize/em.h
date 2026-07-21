@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 #include "../phylogeny.h"
@@ -88,6 +89,10 @@ estimation_results em(Problem& p, em_options opts = {}) {
     // log_total_likelihood_per_tree_ on the problem (consumed by the edge /
     // outside passes and posterior accessors below).
     double prev_llh = p.log_likelihood();
+    std::vector<double> log_likelihood_trace;
+    log_likelihood_trace.reserve(
+        static_cast<std::size_t>(opts.max_iter > 0 ? opts.max_iter : 0) + 1);
+    log_likelihood_trace.push_back(prev_llh);
 
     int  iter_count = 0;
     bool converged  = false;
@@ -117,6 +122,7 @@ estimation_results em(Problem& p, em_options opts = {}) {
         // inside pass so the next iteration's E-step has fresh buffers.
         double new_llh = p.log_likelihood();
         ++iter_count;
+        log_likelihood_trace.push_back(new_llh);
 
         if (opts.verbose) {
             std::cerr << "[optimize::em] iter " << iter_count
@@ -150,10 +156,11 @@ estimation_results em(Problem& p, em_options opts = {}) {
     }
 
     estimation_results results;
-    results.params         = p.get_params();
-    results.log_likelihood = prev_llh;
-    results.num_iterations = iter_count;
-    results.converged      = converged;
+    results.params               = p.get_params();
+    results.log_likelihood       = prev_llh;
+    results.log_likelihood_trace = std::move(log_likelihood_trace);
+    results.num_iterations       = iter_count;
+    results.converged            = converged;
     results.trees.reserve(p.trees.size());
     for (const auto* t : p.trees) results.trees.push_back(*t);
     return results;

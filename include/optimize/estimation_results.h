@@ -39,6 +39,14 @@ struct estimation_results {
     double log_likelihood;
 
     /*!
+     * @brief Log-likelihood trajectory. For EM, entry 0 is the initial
+     *        log-likelihood before any M-step, followed by one value after
+     *        each EM iteration. Thus size is num_iterations + 1. Optimizers
+     *        that do not record a trajectory may leave this empty.
+     */
+    std::vector<double> log_likelihood_trace;
+
+    /*!
      * @brief Number of iterations taken by the optimizer.
      */
     int num_iterations;
