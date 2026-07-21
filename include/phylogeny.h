@@ -106,7 +106,8 @@ std::vector<double> compute_inside_log_likelihood(
     const meta_data&                  metadata,
     const tree& t,
     likelihood_buffer& b,
-    std::vector<D>& node_data
+    std::vector<D>& node_data,
+    double emission_log_weight = 1.0
 ) {
     size_t num_sites = state_transition_model.sites_latent_states.size();
     size_t max_alpha = std::max_element(
@@ -123,9 +124,11 @@ std::vector<double> compute_inside_log_likelihood(
             if (t.tree.out_degree(node_id) == 0) {
                 size_t taxa_id = t.tree[node_id].data;
                 const O& obs = observed_data[taxa_id];
-                for (size_t j = 0; j < alpha; ++j)
-                    b(c, node_id, j) = obs_model.compute_log_emission_probability(
-                        node_data[node_id], j, c, obs);
+                for (size_t j = 0; j < alpha; ++j) {
+                    b(c, node_id, j) = emission_log_weight
+                        * obs_model.compute_log_emission_probability(
+                            node_data[node_id], j, c, obs);
+                }
                 // Hard-label clamp (no-op when metadata.hard_labels is empty).
                 // When set, force the leaf's inside likelihood to a delta at
                 // hard_labels[taxa_id]. The conditional distribution propagates
