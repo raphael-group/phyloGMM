@@ -35,6 +35,7 @@ public:
     std::vector<Eigen::VectorXd> mu;     // k means, each of length d
     std::vector<Eigen::MatrixXd> Sigma;  // k SPD covariance matrices, each d×d
     size_t                       d = 0;  // observation dimensionality
+    bool                         diagonal_covariance = false;
 
     void build();
 
@@ -47,6 +48,7 @@ public:
 
 private:
     std::vector<Eigen::LLT<Eigen::MatrixXd>> chol;     // Cholesky of each Sigma[i]
+    std::vector<Eigen::VectorXd>             inv_diag; // 1 / diag(Sigma[i]) in diagonal mode
     std::vector<double>                      log_det;  // log|Sigma[i]| per component
     double                                   log_2pi_d = 0.0; // d * log(2π) precomputed
 };
