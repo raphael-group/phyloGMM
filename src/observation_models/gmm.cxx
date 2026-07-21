@@ -24,6 +24,8 @@ void gmm_observation_model::build() {
     const size_t k = mu.size();
     chol.clear();
     chol.reserve(k);
+    inv_diag.clear();
+    inv_diag.reserve(k);
     log_det.assign(k, 0.0);
     log_2pi_d = static_cast<double>(d) * std::log(2.0 * M_PI);
 
@@ -41,31 +43,51 @@ void gmm_observation_model::build() {
                 std::to_string(Sigma[i].cols()) + ", expected " +
                 std::to_string(d) + "x" + std::to_string(d));
 
-        Eigen::LLT<Eigen::MatrixXd> llt(Sigma[i]);
-        if (llt.info() != Eigen::Success)
-            throw std::runtime_error(
-                "gmm_observation_model::build: Sigma[" + std::to_string(i) +
-                "] is not positive definite");
+        if (diagonal_covariance) {
+            Eigen::VectorXd diag = Sigma[i].diagonal();
+            for (Eigen::Index j = 0; j < diag.size(); ++j) {
+                if (diag[j] <= 0.0)
+                    throw std::runtime_error(
+                        "gmm_observation_model::build: Sigma[" +
+                        std::to_string(i) + "] diagonal entry " +
+                        std::to_string(j) + " is not positive");
+            }
+            log_det[i] = diag.array().log().sum();
+            inv_diag.push_back(diag.array().inverse().matrix());
+        } else {
+            Eigen::LLT<Eigen::MatrixXd> llt(Sigma[i]);
+            if (llt.info() != Eigen::Success)
+                throw std::runtime_error(
+                    "gmm_observation_model::build: Sigma[" + std::to_string(i) +
+                    "] is not positive definite");
 
-        // log|Σ| = 2 * Σ_j log L_jj, where L is the Cholesky factor.
-        log_det[i] = 2.0 * llt.matrixL()
-                                .toDenseMatrix()
-                                .diagonal()
-                                .array()
-                                .log()
-                                .sum();
-        chol.push_back(std::move(llt));
+            // log|Σ| = 2 * Σ_j log L_jj, where L is the Cholesky factor.
+            log_det[i] = 2.0 * llt.matrixL()
+                                    .toDenseMatrix()
+                                    .diagonal()
+                                    .array()
+                                    .log()
+                                    .sum();
+            chol.push_back(std::move(llt));
+        }
     }
 
-    // observation_parameters: flatten [mu[0], vec(Sigma[0]), mu[1], vec(Sigma[1]), ...]
+    // observation_parameters: flatten [mu[0], covariance params, mu[1], ...].
+    // In diagonal mode, covariance params are only diag(Sigma[i]).
     observation_parameters.clear();
-    observation_parameters.reserve(k * (d + d * d));
+    observation_parameters.reserve(
+        diagonal_covariance ? k * (2 * d) : k * (d + d * d));
     for (size_t i = 0; i < k; ++i) {
         for (size_t j = 0; j < d; ++j)
             observation_parameters.push_back(mu[i][j]);
-        for (size_t r = 0; r < d; ++r)
-            for (size_t c = 0; c < d; ++c)
-                observation_parameters.push_back(Sigma[i](r, c));
+        if (diagonal_covariance) {
+            for (size_t j = 0; j < d; ++j)
+                observation_parameters.push_back(Sigma[i](j, j));
+        } else {
+            for (size_t r = 0; r < d; ++r)
+                for (size_t c = 0; c < d; ++c)
+                    observation_parameters.push_back(Sigma[i](r, c));
+        }
     }
 }
 
@@ -82,9 +104,15 @@ double gmm_observation_model::compute_log_emission_probability(
     size_t                  /*site*/,
     const Eigen::VectorXd&  observation
 ) const {
-    const Eigen::VectorXd diff = observation - mu[alpha];
-    const Eigen::VectorXd z    = chol[alpha].solve(diff);
-    const double quad = diff.dot(z);
+    double quad = 0.0;
+    if (diagonal_covariance) {
+        quad = ((observation - mu[alpha]).array().square()
+                * inv_diag[alpha].array()).sum();
+    } else {
+        const Eigen::VectorXd diff = observation - mu[alpha];
+        const Eigen::VectorXd z    = chol[alpha].solve(diff);
+        quad = diff.dot(z);
+    }
     return -0.5 * (log_2pi_d + log_det[alpha] + quad);
 }
 
