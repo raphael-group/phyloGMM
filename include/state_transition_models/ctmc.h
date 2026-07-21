@@ -40,10 +40,19 @@ namespace phylocore {
  * O(k) matvec path instead of the O(k³) scalar fallback (matters at k >= 4).
  * EM hooks (e_step/m_step) are intentionally not overridden — parameter
  * estimation is a separate, future change.
+ *
+ * complete_data_weight optionally powers the complete CTMC path density.
+ * Its default 1.0 preserves the ordinary exp(tQ) model exactly.
  */
 class ctmc_model : public state_transition_model<> {
 public:
     Eigen::MatrixXd Q;  // k×k rate matrix; rows sum to zero, off-diag ≥ 0.
+
+    // Power applied to the complete CTMC path density. At the default 1.0,
+    // branches use exp(tQ). For w != 1, traversal uses exp(tA), where
+    // A_ii = w Q_ii and A_ij = Q_ij^w (i != j). This is the exact marginal
+    // kernel obtained by integrating [p_Q(path)]^w over branch paths.
+    double complete_data_weight = 1.0;
 
     void build();
 
@@ -69,16 +78,24 @@ public:
 
     // ── Uniform "of Q" accessors (model-agnostic; shared with reversible) ────
     //
-    // For a general (possibly non-reversible) Q, the eigendecomposition is
-    //     Q = U_Q · diag(λ_Q) · U_Q⁻¹
-    // with U_Q, λ_Q, U_Q⁻¹ complex in general. ctmc_model maintains a single
-    // shared cache (one Q across the tree), so the site argument is ignored.
+    // These accessors expose the active branch operator: Q at weight 1, or A
+    // defined above otherwise. Hobolth-Jensen uses the same operator as the
+    // inside/outside traversal, which is required for weighted-path EM.
     // These accessors mirror the ones on reversible_ctmc_model so that
     // templated callers (e.g. optimize::hobolth_jensen_stats) can deduce
     // the scalar type at compile time.
     const Eigen::MatrixXcd& eigenvectors_q(size_t /*site*/)         const { return cache.U;      }
     const Eigen::VectorXcd& eigenvalues_q(size_t /*site*/)          const { return cache.lambda; }
     const Eigen::MatrixXcd& inverse_eigenvectors_q(size_t /*site*/) const { return cache.U_inv;  }
+
+    // The eigendecomposition of the underlying rate generator Q is kept
+    // separately because stationary root probabilities must be derived from
+    // Q, never from the generally non-conservative weighted operator A.
+    const Eigen::MatrixXcd& rate_eigenvectors_q() const { return rate_cache.U; }
+    const Eigen::VectorXcd& rate_eigenvalues_q() const { return rate_cache.lambda; }
+    const Eigen::MatrixXcd& inverse_rate_eigenvectors_q() const {
+        return rate_cache.U_inv;
+    }
 
     // Direct access to the underlying real rate matrix Q (used by callers
     // that need Q_ij directly, e.g. for posterior expected substitution
@@ -92,7 +109,8 @@ private:
         Eigen::VectorXcd lambda;  // k eigenvalues (generally complex)
         Eigen::MatrixXcd U_inv;   // k×k inverse of U
     };
-    eigen_cache cache;
+    eigen_cache cache;       // active branch operator used by traversal
+    eigen_cache rate_cache;  // unweighted generator Q
 };
 
 } // namespace phylocore
