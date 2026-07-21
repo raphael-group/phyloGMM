@@ -23,6 +23,10 @@ void ctmc_model::build() {
 
     const size_t k = static_cast<size_t>(Q.rows());
 
+    if (!std::isfinite(complete_data_weight) || complete_data_weight <= 0.0)
+        throw std::runtime_error(
+            "ctmc_model::build: complete_data_weight must be finite and > 0");
+
     // Validate Q: rows sum to zero, off-diagonal entries non-negative.
     constexpr double row_sum_tol = 1e-8;
     constexpr double off_diag_tol = 1e-10;
@@ -43,14 +47,52 @@ void ctmc_model::build() {
 
     // General eigendecomposition — eigenvalues may be complex since Q
     // is not assumed reversible.
-    Eigen::EigenSolver<Eigen::MatrixXd> solver(Q, /* computeEigenvectors= */ true);
-    if (solver.info() != Eigen::Success)
+    Eigen::EigenSolver<Eigen::MatrixXd> rate_solver(
+        Q, /* computeEigenvectors= */ true);
+    if (rate_solver.info() != Eigen::Success)
         throw std::runtime_error(
             "ctmc_model::build: eigendecomposition of Q failed");
 
-    cache.U      = solver.eigenvectors();
-    cache.lambda = solver.eigenvalues();
-    cache.U_inv  = cache.U.inverse();
+    rate_cache.U      = rate_solver.eigenvectors();
+    rate_cache.lambda = rate_solver.eigenvalues();
+    rate_cache.U_inv  = rate_cache.U.inverse();
+
+    // Preserve the exact legacy path, including the same eigendecomposition,
+    // when w_C == 1. For other weights, the powered complete-path density has
+    // branch kernel exp(tA), A_ii=w_C Q_ii, A_ij=Q_ij^w_C.
+    if (complete_data_weight == 1.0) {
+        cache = rate_cache;
+    } else {
+        Eigen::MatrixXd A(Q.rows(), Q.cols());
+        for (size_t i = 0; i < k; ++i) {
+            for (size_t j = 0; j < k; ++j) {
+                A(static_cast<Eigen::Index>(i),
+                  static_cast<Eigen::Index>(j)) =
+                    (i == j)
+                        ? complete_data_weight * Q(
+                              static_cast<Eigen::Index>(i),
+                              static_cast<Eigen::Index>(i))
+                        : std::pow(std::max(
+                              0.0, Q(static_cast<Eigen::Index>(i),
+                                     static_cast<Eigen::Index>(j))),
+                              complete_data_weight);
+                if (!std::isfinite(A(static_cast<Eigen::Index>(i),
+                                     static_cast<Eigen::Index>(j))))
+                    throw std::runtime_error(
+                        "ctmc_model::build: weighted path operator contains "
+                        "a non-finite entry");
+            }
+        }
+        Eigen::EigenSolver<Eigen::MatrixXd> weighted_solver(
+            A, /* computeEigenvectors= */ true);
+        if (weighted_solver.info() != Eigen::Success)
+            throw std::runtime_error(
+                "ctmc_model::build: eigendecomposition of weighted path "
+                "operator failed");
+        cache.U      = weighted_solver.eigenvectors();
+        cache.lambda = weighted_solver.eigenvalues();
+        cache.U_inv  = cache.U.inverse();
+    }
 
     // Single shared site_space — the paper assumes one Q across the tree.
     sites_latent_states = {{ k, {}, 0 }};
