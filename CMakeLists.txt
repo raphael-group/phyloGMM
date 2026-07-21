@@ -13,6 +13,14 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -ffast-math -march=native")
 
 project(phylocore VERSION 0.1)
 
+# GCC 8's libstdc++ does not implement floating-point std::from_chars.
+# csv-parser/classify_scalar can fall back to a compatible parser when this
+# macro is defined, which keeps builds working on older HPC/server toolchains.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+  add_compile_definitions(CLASSIFY_SCALAR_DISABLE_STD_FLOAT_FROM_CHARS)
+endif()
+
 # ── Third-party dependencies ──────────────────────────────────────────────────
 include(FetchContent)
 
@@ -45,27 +53,40 @@ add_library(phylocore_core STATIC
 target_include_directories(phylocore_core PUBLIC include ${csv-parser_SOURCE_DIR}/include)
 target_link_libraries(phylocore_core PUBLIC Eigen3::Eigen)
 
-# ── IPOPT (required by consumers that include optimize/direct.h) ────────────
-# Pulled in per-executable rather than added to phylocore_core.
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(IPOPT REQUIRED IMPORTED_TARGET ipopt>=3)
+# ── IPOPT (optional; only required by optimize/direct.h consumers) ──────────
+# Pulled in per-executable rather than added to phylocore_core so targets like
+# run_phylo_gmm can still be configured and built on systems without IPOPT.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(IPOPT QUIET IMPORTED_TARGET ipopt>=3)
+endif()
+
+if(IPOPT_FOUND)
+    message(STATUS "Found IPOPT via pkg-config; enabling IPOPT-backed targets")
+else()
+    message(STATUS "IPOPT not found; skipping IPOPT-backed targets")
+endif()
 
 # ── Driver: run_gtr ──────────────────────────────────────────────────────────
-add_executable(run_gtr src/run_gtr.cxx)
-target_link_libraries(run_gtr PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_gtr
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
+if(IPOPT_FOUND)
+    add_executable(run_gtr src/run_gtr.cxx)
+    target_link_libraries(run_gtr PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_gtr
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+endif()
 
 # ── Driver: run_gtr_blens ────────────────────────────────────────────────────
 # Branch-length-only GTR MLE via optimize::direct (IPOPT). Demonstrates the
 # "narrow get_params" pattern: same problem class template as run_gtr, just a
 # smaller parameter vector. IPOPT needed since this uses optimize::direct.
-add_executable(run_gtr_blens src/run_gtr_blens.cxx)
-target_link_libraries(run_gtr_blens PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_gtr_blens
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
+if(IPOPT_FOUND)
+    add_executable(run_gtr_blens src/run_gtr_blens.cxx)
+    target_link_libraries(run_gtr_blens PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_gtr_blens
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+endif()
 
 # ── Driver: run_gtr_em ───────────────────────────────────────────────────────
 # Hobolth-Jensen EM driver. optimize/em.h is header-only and does NOT depend
@@ -81,21 +102,25 @@ target_compile_definitions(run_gtr_em
 # GTR EM + simulated annealing: warms up parameters with EM on the starting
 # topology, then runs SA with EM re-fitting at each NNI proposal. Header-only
 # EM — no IPOPT dependency.
-add_executable(run_gtr_example src/run_gtr_example.cxx)
-target_link_libraries(run_gtr_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_gtr_example
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
+if(IPOPT_FOUND)
+    add_executable(run_gtr_example src/run_gtr_example.cxx)
+    target_link_libraries(run_gtr_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_gtr_example
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+endif()
 
 # ── Driver: run_melt_example ─────────────────────────────────────────────────
 # MELT model smoke test: SA (optimizer_type::none) on an 8-taxon / 100-site
 # simulated dataset. Ground-truth parameters, topology perturbed by 2 NNIs.
 # No IPOPT dependency (optimizer_type::none).
-add_executable(run_melt_example src/run_melt_example.cxx)
-target_link_libraries(run_melt_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_melt_example
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
+if(IPOPT_FOUND)
+    add_executable(run_melt_example src/run_melt_example.cxx)
+    target_link_libraries(run_melt_example PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_melt_example
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+endif()
 
 # ── Driver: run_phylo_gmm ────────────────────────────────────────────────────
 # phyloGMM EM driver on real data (Newick tree + CSV observations). Closed-form
@@ -121,33 +146,37 @@ add_test(NAME test_run_laml_likelihood COMMAND run_laml_likelihood)
 # LAML EM (Mode #3): inside/edge_inside/outside E-step + IPOPT-based M-step on
 # the auxiliary Q-function over (ν, φ, branches). Links IPOPT because the
 # M-step calls optimize::direct.
-add_executable(run_laml src/run_laml.cxx)
-target_link_libraries(run_laml PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_laml
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
-add_test(NAME test_run_laml COMMAND run_laml)
+if(IPOPT_FOUND)
+    add_executable(run_laml src/run_laml.cxx)
+    target_link_libraries(run_laml PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_laml
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME test_run_laml COMMAND run_laml)
+endif()
 
 # ── Driver: run_laml_pro ─────────────────────────────────────────────────────
 # LAML-Pro EM (Mode #3): same shape as run_laml but with NATIVE parameters
 # (no logit/log reparameterization) + explicit bounds via optimize::direct.
 # Ultrametric constraints are deferred until the equality_constraint API lands
 # (TODO in src/run_laml_pro.cxx).
-add_executable(run_laml_pro src/run_laml_pro.cxx)
-target_link_libraries(run_laml_pro PRIVATE phylocore_core csv PkgConfig::IPOPT)
-target_compile_definitions(run_laml_pro
-    PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-)
-add_test(NAME test_run_laml_pro COMMAND run_laml_pro)
+if(IPOPT_FOUND)
+    add_executable(run_laml_pro src/run_laml_pro.cxx)
+    target_link_libraries(run_laml_pro PRIVATE phylocore_core csv PkgConfig::IPOPT)
+    target_compile_definitions(run_laml_pro
+        PRIVATE PHYLOCORE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME test_run_laml_pro COMMAND run_laml_pro)
 
-# Cross-check variant: run on the LAML-Pro n250 fixture if available.
-# Loads PHYLOCORE_LAML_FIXTURE_DIR via test property. Skipped at CI time if
-# the directory does not exist.
-add_test(NAME test_run_laml_pro_fixture COMMAND run_laml_pro)
-set_tests_properties(test_run_laml_pro_fixture PROPERTIES
-    ENVIRONMENT "PHYLOCORE_LAML_FIXTURE_DIR=/Users/gc3045/Desktop/git/LAML-Pro/examples/n250_m30_character_matrix"
-    TIMEOUT 600
-)
+    # Cross-check variant: run on the LAML-Pro n250 fixture if available.
+    # Loads PHYLOCORE_LAML_FIXTURE_DIR via test property. Skipped at CI time if
+    # the directory does not exist.
+    add_test(NAME test_run_laml_pro_fixture COMMAND run_laml_pro)
+    set_tests_properties(test_run_laml_pro_fixture PROPERTIES
+        ENVIRONMENT "PHYLOCORE_LAML_FIXTURE_DIR=/Users/gc3045/Desktop/git/LAML-Pro/examples/n250_m30_character_matrix"
+        TIMEOUT 600
+    )
+endif()
 
 # ── Tests / drivers (disabled until consumer fixes land) ─────────────────────
 # test_gtr, test_phylo_gmm, test_laml, run_phylo_gmm all need
@@ -163,8 +192,10 @@ target_compile_definitions(test_gtr_raxml
 )
 
 # ── Smoke test: optimize::direct (IPOPT) ─────────────────────────────────────
-add_executable(direct_smoke tests/optimize/direct_smoke.cxx)
-target_link_libraries(direct_smoke PRIVATE phylocore_core PkgConfig::IPOPT)
+if(IPOPT_FOUND)
+    add_executable(direct_smoke tests/optimize/direct_smoke.cxx)
+    target_link_libraries(direct_smoke PRIVATE phylocore_core PkgConfig::IPOPT)
+endif()
 
 # ── Test infra: phyloGMM synthetic data simulator ────────────────────────────
 add_executable(simulate_phylo_gmm tests/phylo_gmm/simulate.cxx)
@@ -199,6 +230,25 @@ add_executable(test_phylo_gmm_flags tests/phylo_gmm/test_phylo_gmm_flags.cxx)
 target_link_libraries(test_phylo_gmm_flags PRIVATE phylocore_core)
 add_test(NAME test_phylo_gmm_flags COMMAND test_phylo_gmm_flags)
 
+# ── phyloGMM CLI parameter-initialization test ───────────────────────────────
+# Verifies --init_params_json installs user-defined Q, mu, Sigma, and pi as the
+# recorded initial parameters before any EM update runs.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME test_run_phylo_gmm_init_params
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/phylo_gmm/test_run_phylo_gmm_init_params.py
+                $<TARGET_FILE:run_phylo_gmm>
+    )
+    add_test(
+        NAME test_run_phylo_gmm_weights
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/phylo_gmm/test_run_phylo_gmm_weights.py
+                $<TARGET_FILE:run_phylo_gmm>
+    )
+endif()
+
 # ── phyloGMM multi-tree suff_stats aggregation test ──────────────────────────
 # Validates that compute_suff_stats() correctly SUMS per-tree contributions
 # when the problem holds multiple trees. Compares "all trees in one problem"
@@ -218,10 +268,12 @@ add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 # add_test(NAME test_melt_ctmc COMMAND test_melt_ctmc)
 
 # ── Topology search unit tests ───────────────────────────────────────────────
-add_executable(test_topology_search
-    tests/topology_search/test_topology_search.cxx)
-target_link_libraries(test_topology_search PRIVATE phylocore_core PkgConfig::IPOPT)
-add_test(NAME test_topology_search COMMAND test_topology_search)
+if(IPOPT_FOUND)
+    add_executable(test_topology_search
+        tests/topology_search/test_topology_search.cxx)
+    target_link_libraries(test_topology_search PRIVATE phylocore_core PkgConfig::IPOPT)
+    add_test(NAME test_topology_search COMMAND test_topology_search)
+endif()
 
 # ── Python bindings (optional) ────────────────────────────────────────────────
 # Uncomment when bindings are added:
