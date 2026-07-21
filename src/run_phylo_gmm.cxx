@@ -26,6 +26,9 @@
 // CLI (flag form — required for any non-default mode and for multi-tree):
 //   run_phylo_gmm --k K [--max_iter N] [--tol T] [--q_init_rate R] \
 //                 [--fix_pi 0|1] [--n_init N] \
+//                 [--ctmc_weight W_C] [--emission_weight W_E] \
+//                 [--kmeans_init seeding|standard] \
+//                 [--init_params_json params.json] \
 //                 --tree T1 --obs O1 [--tree T2 --obs O2 ...]            \
 //                 [--fix_q <rate> | --fix_emission | --fix_labels <csv>  \
 //                  | --bayes_opt --true_q_exit_rate <r>                  \
@@ -35,7 +38,8 @@
 //   * obs CSV: first column = taxon/cell name, remaining columns = y_0..y_{d-1}
 //   * tree:    single Newick per first non-empty line of <tree_file>
 //   * default EM: 2 * n_init restarts total: n_init k-means++ (seeds 42..)
-//     plus n_init random (seeds 1000..). Deterministic seeds keep per-restart
+//     plus n_init random (seeds 1000..). --kmeans_init standard adds Lloyd
+//     refinement after k-means++ seeding. Deterministic seeds keep per-restart
 //     outputs reproducible across runs.
 //
 // Output (JSON to stdout): unified across modes. Mode flags echo into the
@@ -44,23 +48,31 @@
 //     "Q", "mu", "Sigma", "pi", "leaf_names", "posteriors", "leaf_labels",
 //     "internal_node_posteriors", "internal_node_ids",
 //     "expected_transitions", "expected_dwell_times", "per_restart",
+//     "per_restart[].log_likelihood_trace",
+//     "per_restart[].complete_data_objective_trace",
 //     "mode": { "fix_q_rate": <r>?, "fix_emission": <b>?,
+//               "ctmc_weight": <w_C>, "emission_weight": <w_E>,
 //               "fix_labels_csv": "<path>"?, "bayes_opt": <b>?,
-//               "true_q_exit_rate": <r>?, "true_simplex_scale": <s>? } }
+//               "true_q_exit_rate": <r>?, "true_simplex_scale": <s>?,
+//               "init_params_json": "<path>"? } }
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -109,24 +121,28 @@ static constexpr double SIMPLEX_4[4][3] = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tiny JSON loader (sufficient for --bayes_opt_truth_json / --fix_q_json).
+// Tiny JSON loader (sufficient for --bayes_opt_truth_json / --fix_q_json /
+// --init_params_json).
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Recognizes a flat object with numeric scalars and 1D/2D numeric arrays.
-// Strings, nested objects, bools, and >2D arrays are NOT supported — extra
-// such keys are tolerated (skipped) but cannot themselves contain those types
-// nested.  Suitable only for the truth-parameter schema documented in the
-// CLI help text. Throws std::runtime_error on any malformed input.
+// Recognizes a flat object with numeric scalars and 1D/2D/3D numeric arrays.
+// Strings, nested objects, bools, and deeper arrays are skipped for unknown
+// keys. Suitable only for the parameter schema documented in the CLI help
+// text. Throws std::runtime_error on any malformed input.
 //
 // Schema accepted (extra keys ignored):
-//   { "Q": [[k x k]], "mu": [[k x d]],
-//     "sigma_diag": [[k x d]], "pi": [k] }
+//   { "Q": [[K x K]], "mu": [[K x d]],
+//     "Sigma": [[[d x d], ... K]], "sigma_diag": [[K x d]], "pi": [K] }
+// "Sigma" is preferred for full covariance initialization; "sigma_diag" is a
+// compact diagonal-covariance spelling and remains compatible with older
+// --init_emission_json files.
 struct truth_json {
-    std::vector<std::vector<double>> Q;          // K × K
-    std::vector<std::vector<double>> mu;         // K × d
-    std::vector<std::vector<double>> sigma_diag; // K × d
-    std::vector<double>              pi;         // K (optional)
-    bool                             has_pi = false;
+    std::vector<std::vector<double>>              Q;          // K × K
+    std::vector<std::vector<double>>              mu;         // K × d
+    std::vector<std::vector<std::vector<double>>> Sigma;      // K × d × d
+    std::vector<std::vector<double>>              sigma_diag; // K × d
+    std::vector<double>                           pi;         // K (optional)
+    bool                                          has_pi = false;
 };
 
 static truth_json load_truth_json(const std::string& path) {
@@ -204,6 +220,21 @@ static truth_json load_truth_json(const std::string& path) {
         expect(']');
         return out;
     };
+    // Parse a 3D array of numbers (caller positioned at outer '[').
+    auto parse_num_3d = [&]() -> std::vector<std::vector<std::vector<double>>> {
+        expect('[');
+        std::vector<std::vector<std::vector<double>>> out;
+        skip_ws();
+        if (p < src.size() && src[p] == ']') { ++p; return out; }
+        while (true) {
+            out.push_back(parse_num_2d());
+            skip_ws();
+            if (p < src.size() && src[p] == ',') { ++p; continue; }
+            break;
+        }
+        expect(']');
+        return out;
+    };
     // Skip an arbitrary JSON value (used for tolerated extra keys at the top
     // level). Supports nested objects/arrays so the skip is balanced, but the
     // contents are discarded.
@@ -243,6 +274,8 @@ static truth_json load_truth_json(const std::string& path) {
             out.Q = parse_num_2d();
         } else if (key == "mu") {
             out.mu = parse_num_2d();
+        } else if (key == "Sigma" || key == "sigma") {
+            out.Sigma = parse_num_3d();
         } else if (key == "sigma_diag") {
             out.sigma_diag = parse_num_2d();
         } else if (key == "pi") {
@@ -281,6 +314,158 @@ static Eigen::MatrixXd vec2d_to_matrix(const std::vector<std::vector<double>>& v
     return M;
 }
 
+static std::vector<Eigen::VectorXd>
+vec2d_to_vector_list(const std::vector<std::vector<double>>& v,
+                     std::size_t rows,
+                     std::size_t cols,
+                     const char* label) {
+    const Eigen::MatrixXd M = vec2d_to_matrix(v, rows, cols, label);
+    std::vector<Eigen::VectorXd> out(rows, Eigen::VectorXd::Zero(cols));
+    for (std::size_t i = 0; i < rows; ++i)
+        out[i] = M.row(static_cast<Eigen::Index>(i)).transpose();
+    return out;
+}
+
+static std::vector<Eigen::MatrixXd>
+sigma_from_json(const truth_json& tj,
+                std::size_t       k,
+                std::size_t       d,
+                bool              diagonal_covariance,
+                double            diag_ridge,
+                const char*       context) {
+    std::vector<Eigen::MatrixXd> out(k, Eigen::MatrixXd::Zero(d, d));
+
+    if (!tj.Sigma.empty()) {
+        if (tj.Sigma.size() != k)
+            throw std::runtime_error(
+                std::string(context) + ": Sigma expected " +
+                std::to_string(k) + " matrices, got " +
+                std::to_string(tj.Sigma.size()));
+        for (std::size_t i = 0; i < k; ++i) {
+            const std::string label =
+                std::string(context) + ": Sigma[" + std::to_string(i) + "]";
+            Eigen::MatrixXd S = vec2d_to_matrix(
+                tj.Sigma[i], d, d, label.c_str());
+
+            for (Eigen::Index r = 0; r < S.rows(); ++r) {
+                for (Eigen::Index c = 0; c < S.cols(); ++c) {
+                    if (!std::isfinite(S(r, c)))
+                        throw std::runtime_error(label + " contains non-finite entries");
+                }
+            }
+
+            if (diagonal_covariance) {
+                Eigen::MatrixXd D = Eigen::MatrixXd::Zero(d, d);
+                for (std::size_t j = 0; j < d; ++j) {
+                    const double s = S(static_cast<Eigen::Index>(j),
+                                       static_cast<Eigen::Index>(j));
+                    if (s <= 0.0)
+                        throw std::runtime_error(
+                            label + " diagonal entries must be > 0");
+                    D(static_cast<Eigen::Index>(j),
+                      static_cast<Eigen::Index>(j)) = s;
+                }
+                out[i] = D;
+            } else {
+                const double asym = (S - S.transpose()).cwiseAbs().maxCoeff();
+                const double tol = 1e-8;
+                if (asym > tol)
+                    throw std::runtime_error(label + " must be symmetric");
+                S = 0.5 * (S + S.transpose());
+                Eigen::LLT<Eigen::MatrixXd> llt(S);
+                if (llt.info() != Eigen::Success)
+                    throw std::runtime_error(label + " must be positive definite");
+                out[i] = std::move(S);
+            }
+        }
+        return out;
+    }
+
+    if (tj.sigma_diag.empty())
+        throw std::runtime_error(
+            std::string(context) +
+            ": required key 'Sigma' or 'sigma_diag' missing or empty");
+
+    const Eigen::MatrixXd sd_mat =
+        vec2d_to_matrix(tj.sigma_diag, k, d,
+                        (std::string(context) + ": sigma_diag").c_str());
+    for (std::size_t i = 0; i < k; ++i) {
+        for (std::size_t j = 0; j < d; ++j) {
+            const double s = sd_mat(static_cast<Eigen::Index>(i),
+                                    static_cast<Eigen::Index>(j));
+            if (!std::isfinite(s) || s <= 0.0)
+                throw std::runtime_error(
+                    std::string(context) +
+                    ": sigma_diag entries must be > 0 (cluster " +
+                    std::to_string(i) + ", dim " + std::to_string(j) + ")");
+            out[i](static_cast<Eigen::Index>(j),
+                   static_cast<Eigen::Index>(j)) = s + diag_ridge;
+        }
+    }
+    return out;
+}
+
+static void validate_ctmc_q(Eigen::MatrixXd& Q, const char* label) {
+    if (Q.rows() != Q.cols())
+        throw std::runtime_error(
+            std::string(label) + ": Q must be square");
+    const Eigen::Index k = Q.rows();
+    const double tol = 1e-8;
+    for (Eigen::Index i = 0; i < k; ++i) {
+        double off_sum = 0.0;
+        for (Eigen::Index j = 0; j < k; ++j) {
+            const double v = Q(i, j);
+            if (!std::isfinite(v))
+                throw std::runtime_error(
+                    std::string(label) + ": Q contains non-finite entries");
+            if (i == j) continue;
+            if (v < -tol)
+                throw std::runtime_error(
+                    std::string(label) + ": Q off-diagonal entries must be >= 0");
+            if (v < 0.0) Q(i, j) = 0.0;
+            off_sum += Q(i, j);
+        }
+        if (Q(i, i) > tol)
+            throw std::runtime_error(
+                std::string(label) + ": Q diagonal entries must be <= 0");
+        const double row_sum = Q.row(i).sum();
+        const double scaled_tol = tol * std::max(1.0, off_sum);
+        if (std::abs(row_sum) > scaled_tol)
+            throw std::runtime_error(
+                std::string(label) +
+                ": each Q row must sum to zero; row " +
+                std::to_string(i) + " sums to " + std::to_string(row_sum));
+        Q(i, i) = -off_sum;
+    }
+}
+
+static Eigen::VectorXd normalized_pi_from_json(const truth_json& tj,
+                                               std::size_t       k,
+                                               const char*       context) {
+    if (!tj.has_pi)
+        return Eigen::VectorXd::Constant(static_cast<Eigen::Index>(k),
+                                         1.0 / static_cast<double>(k));
+    if (tj.pi.size() != k)
+        throw std::runtime_error(
+            std::string(context) + ": pi expected " + std::to_string(k) +
+            " entries, got " + std::to_string(tj.pi.size()));
+    Eigen::VectorXd pi(static_cast<Eigen::Index>(k));
+    double sum = 0.0;
+    for (std::size_t i = 0; i < k; ++i) {
+        const double v = tj.pi[i];
+        if (!std::isfinite(v) || v < 0.0)
+            throw std::runtime_error(
+                std::string(context) + ": pi entries must be finite and >= 0");
+        pi[static_cast<Eigen::Index>(i)] = v;
+        sum += v;
+    }
+    if (sum <= 0.0)
+        throw std::runtime_error(
+            std::string(context) + ": pi must have positive total mass");
+    pi /= sum;
+    return pi;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // phylo_gmm_problem — defined inline in this driver (anonymous namespace) so
 // no public header is needed. The unit tests in tests/phylo_gmm/ each carry
@@ -288,6 +473,17 @@ static Eigen::MatrixXd vec2d_to_matrix(const std::vector<std::vector<double>>& v
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
+
+constexpr double expected_transition_tol = 1e-10;
+
+// Weighted EM target:
+//   Q_w = Q_root + w_C Q_CTMC + w_E Q_emission.
+// The E-step uses the corresponding powered factors. Gaussian leaf log
+// emissions are multiplied by w_E. Integrating a powered CTMC path density
+// along a branch gives exp(tA), A_ii=w_C q_ii and A_ij=q_ij^w_C; ctmc_model
+// supplies that kernel and Hobolth-Jensen uses the same operator for E[N,T].
+// The positive scalar weights cancel from each block's closed-form M-step,
+// but they change its sufficient statistics through the weighted E-step.
 
 class phylo_gmm_problem
     : public phylocore::optimize::joint_optimization_problem<
@@ -299,6 +495,10 @@ public:
     bool fix_Q         = false;
     bool fix_emission  = false;
     bool stationary_pi = false;  // default: pi is a free EM parameter (= root posterior)
+    double ctmc_weight = 1.0;
+    double emission_weight = 1.0;
+
+    double emission_log_weight() const override { return emission_weight; }
 
     std::size_t k_() const { return static_cast<std::size_t>(stm->Q.rows()); }
     std::size_t d_() const { return obs->d; }
@@ -343,8 +543,8 @@ public:
     }
 
     Eigen::VectorXd extract_stationary_pi_() const {
-        const Eigen::VectorXcd& lambda = stm->eigenvalues_q(0);
-        const Eigen::MatrixXcd& Uinv   = stm->inverse_eigenvectors_q(0);
+        const Eigen::VectorXcd& lambda = stm->rate_eigenvalues_q();
+        const Eigen::MatrixXcd& Uinv   = stm->inverse_rate_eigenvectors_q();
         const std::size_t k = k_();
 
         Eigen::Index best = 0;
@@ -385,10 +585,16 @@ public:
         if (!fix_emission) {
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t a = 0; a < d; ++a) p.push_back(obs->mu[i][a]);
-            for (std::size_t i = 0; i < k; ++i)
-                for (std::size_t r = 0; r < d; ++r)
-                    for (std::size_t c = 0; c < d; ++c)
-                        p.push_back(obs->Sigma[i](r, c));
+            if (obs->diagonal_covariance) {
+                for (std::size_t i = 0; i < k; ++i)
+                    for (std::size_t a = 0; a < d; ++a)
+                        p.push_back(obs->Sigma[i](a, a));
+            } else {
+                for (std::size_t i = 0; i < k; ++i)
+                    for (std::size_t r = 0; r < d; ++r)
+                        for (std::size_t c = 0; c < d; ++c)
+                            p.push_back(obs->Sigma[i](r, c));
+            }
         }
         if (!stationary_pi) {
             for (std::size_t i = 0; i + 1 < k; ++i)
@@ -403,7 +609,10 @@ public:
 
         std::size_t expected = 0;
         if (!fix_Q)         expected += k * (k - 1);
-        if (!fix_emission)  expected += k * d + k * d * d;
+        if (!fix_emission) {
+            expected += k * d;
+            expected += obs->diagonal_covariance ? k * d : k * d * d;
+        }
         if (!stationary_pi) expected += (k - 1);
         if (params.size() != expected) {
             throw phylocore::optimize::invalid_parameters_error(
@@ -441,14 +650,25 @@ public:
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t a = 0; a < d; ++a) obs->mu[i][a] = params[idx++];
             for (std::size_t i = 0; i < k; ++i) {
-                for (std::size_t r = 0; r < d; ++r)
-                    for (std::size_t c = 0; c < d; ++c)
-                        obs->Sigma[i](r, c) = params[idx++];
-                obs->Sigma[i] = 0.5 * (obs->Sigma[i] + obs->Sigma[i].transpose());
-                Eigen::LLT<Eigen::MatrixXd> llt(obs->Sigma[i]);
-                if (llt.info() != Eigen::Success) {
-                    throw phylocore::optimize::invalid_parameters_error(
-                        "Sigma not PD", idx - 1);
+                if (obs->diagonal_covariance) {
+                    for (std::size_t a = 0; a < d; ++a) {
+                        const double v = params[idx++];
+                        if (v <= 0.0) {
+                            throw phylocore::optimize::invalid_parameters_error(
+                                "Sigma diagonal <= 0", idx - 1);
+                        }
+                        obs->Sigma[i](a, a) = v;
+                    }
+                } else {
+                    for (std::size_t r = 0; r < d; ++r)
+                        for (std::size_t c = 0; c < d; ++c)
+                            obs->Sigma[i](r, c) = params[idx++];
+                    obs->Sigma[i] = 0.5 * (obs->Sigma[i] + obs->Sigma[i].transpose());
+                    Eigen::LLT<Eigen::MatrixXd> llt(obs->Sigma[i]);
+                    if (llt.info() != Eigen::Success) {
+                        throw phylocore::optimize::invalid_parameters_error(
+                            "Sigma not PD", idx - 1);
+                    }
                 }
             }
         }
@@ -481,6 +701,7 @@ public:
         Eigen::VectorXd               responsibility_total;
         std::vector<Eigen::VectorXd>  mu_numerator;
         std::vector<Eigen::MatrixXd>  Sigma_outer;
+        std::vector<Eigen::VectorXd>  Sigma_diag_outer;
         Eigen::VectorXd               root_gamma_total;
         Eigen::MatrixXd               N_total;
         Eigen::VectorXd               T_total;
@@ -493,11 +714,13 @@ public:
 
         suff_stats_type ss;
         ss.responsibility_total = Eigen::VectorXd::Zero(k);
-        if (!fix_emission) {
-            ss.mu_numerator.assign(k, Eigen::VectorXd::Zero(d));
+        ss.mu_numerator.assign(k, Eigen::VectorXd::Zero(d));
+        if (obs->diagonal_covariance) {
+            ss.Sigma_diag_outer.assign(k, Eigen::VectorXd::Zero(d));
+        } else {
             ss.Sigma_outer.assign(k, Eigen::MatrixXd::Zero(d, d));
         }
-        if (!stationary_pi) ss.root_gamma_total = Eigen::VectorXd::Zero(k);
+        ss.root_gamma_total = Eigen::VectorXd::Zero(k);
 
         for (std::size_t ti = 0; ti < trees.size(); ++ti) {
             const tree& t = *trees[ti];
@@ -505,32 +728,37 @@ public:
                 if (t.tree.out_degree(static_cast<int>(v)) != 0) continue;
                 const std::size_t taxa_id = t.tree[static_cast<int>(v)].data;
                 const Eigen::VectorXd& y  = (*observed_data)[taxa_id];
+                Eigen::VectorXd y_sq;
+                Eigen::MatrixXd yyT;
+                if (obs->diagonal_covariance) {
+                    y_sq = y.array().square().matrix();
+                } else {
+                    yyT = y * y.transpose();
+                }
 
                 for (std::size_t c = 0; c < num_sites; ++c) {
                     auto log_gamma = leaf_posterior(ti, v, c);
                     for (std::size_t i = 0; i < k; ++i) {
                         const double r = std::exp(log_gamma[i]);
                         ss.responsibility_total[i] += r;
-                        if (!fix_emission) {
-                            ss.mu_numerator[i].noalias() += r * y;
-                            ss.Sigma_outer[i].noalias()  += r * (y * y.transpose());
+                        ss.mu_numerator[i].noalias() += r * y;
+                        if (obs->diagonal_covariance) {
+                            ss.Sigma_diag_outer[i].noalias() += r * y_sq;
+                        } else {
+                            ss.Sigma_outer[i].noalias() += r * yyT;
                         }
                     }
                 }
             }
-            if (!stationary_pi) {
-                for (std::size_t c = 0; c < num_sites; ++c) {
-                    auto log_gamma = root_posterior(ti, c);
-                    for (std::size_t i = 0; i < k; ++i)
-                        ss.root_gamma_total[i] += std::exp(log_gamma[i]);
-                }
+            for (std::size_t c = 0; c < num_sites; ++c) {
+                auto log_gamma = root_posterior(ti, c);
+                for (std::size_t i = 0; i < k; ++i)
+                    ss.root_gamma_total[i] += std::exp(log_gamma[i]);
             }
         }
-        if (!fix_Q) {
-            auto hj = phylocore::optimize::hobolth_jensen_stats(*this);
-            ss.N_total = hj.N_total;
-            ss.T_total = hj.T_total;
-        }
+        auto hj = phylocore::optimize::hobolth_jensen_stats(*this);
+        ss.N_total = hj.N_total;
+        ss.T_total = hj.T_total;
         return ss;
     }
 
@@ -551,11 +779,23 @@ public:
             for (std::size_t i = 0; i < k; ++i) {
                 const double N_i = ss.responsibility_total[i];
                 if (N_i < 1e-12) continue;
-                Eigen::MatrixXd S = ss.Sigma_outer[i] / N_i
-                                  - mu_new[i] * mu_new[i].transpose();
-                S = 0.5 * (S + S.transpose());
-                S += 1e-6 * Eigen::MatrixXd::Identity(d, d);
-                Sigma_new[i] = S;
+                if (obs->diagonal_covariance) {
+                    Eigen::VectorXd diag =
+                        ss.Sigma_diag_outer[i] / N_i
+                        - mu_new[i].array().square().matrix();
+                    for (std::size_t a = 0; a < d; ++a) {
+                        if (diag[static_cast<Eigen::Index>(a)] < 0.0)
+                            diag[static_cast<Eigen::Index>(a)] = 0.0;
+                        diag[static_cast<Eigen::Index>(a)] += 1e-6;
+                    }
+                    Sigma_new[i] = diag.asDiagonal();
+                } else {
+                    Eigen::MatrixXd S = ss.Sigma_outer[i] / N_i
+                                      - mu_new[i] * mu_new[i].transpose();
+                    S = 0.5 * (S + S.transpose());
+                    S += 1e-6 * Eigen::MatrixXd::Identity(d, d);
+                    Sigma_new[i] = S;
+                }
             }
         }
         Eigen::MatrixXd Q_new = stm->Q;
@@ -564,13 +804,15 @@ public:
                 const double T_i = ss.T_total[i];
                 if (T_i < 1e-12) continue;
                 double row_off = 0.0;
-                for (std::size_t j = 0; j < k; ++j) {
-                    if (i == j) continue;
-                    const double Nij = ss.N_total(i, j);
-                    const double v = (Nij > 0.0) ? Nij / T_i : 0.0;
-                    Q_new(i, j) = v;
-                    row_off += v;
-                }
+	                for (std::size_t j = 0; j < k; ++j) {
+	                    if (i == j) continue;
+	                    const double raw_Nij = ss.N_total(i, j);
+	                    const double Nij =
+	                        (raw_Nij > expected_transition_tol) ? raw_Nij : 0.0;
+	                    const double v = (Nij > 0.0) ? Nij / T_i : 0.0;
+	                    Q_new(i, j) = v;
+	                    row_off += v;
+	                }
                 Q_new(i, i) = -row_off;
             }
         }
@@ -631,13 +873,12 @@ public:
         }
     }
 
-    void initialize_kmeans_pp(uint64_t seed) {
+    std::vector<Eigen::VectorXd> kmeans_pp_seed_centres_(uint64_t seed) const {
         const std::size_t k = k_();
-        const std::size_t d = obs->d;
         std::mt19937_64 rng(seed);
         const auto& Y = *observed_data;
         const std::size_t N = Y.size();
-        if (N < k) throw std::runtime_error("initialize_kmeans_pp: N < k");
+        if (N < k) throw std::runtime_error("kmeans_pp_seed_centres_: N < k");
 
         std::uniform_int_distribution<std::size_t> uidx(0, N - 1);
         std::vector<Eigen::VectorXd> centres;
@@ -664,6 +905,69 @@ public:
             }
             centres.push_back(Y[pick]);
         }
+        return centres;
+    }
+
+    void refine_centres_lloyd_(std::vector<Eigen::VectorXd>& centres,
+                               int max_iter,
+                               double tol) const {
+        const std::size_t k = centres.size();
+        const std::size_t d = obs->d;
+        const auto& Y = *observed_data;
+        const std::size_t N = Y.size();
+        if (max_iter <= 0 || k == 0 || N == 0) return;
+
+        std::vector<std::size_t> assignment(N, k);
+        for (int iter = 0; iter < max_iter; ++iter) {
+            std::vector<Eigen::VectorXd> sums(k, Eigen::VectorXd::Zero(d));
+            std::vector<std::size_t> counts(k, 0);
+            bool changed = false;
+
+            for (std::size_t n = 0; n < N; ++n) {
+                std::size_t best = 0;
+                double best_dist = (Y[n] - centres[0]).squaredNorm();
+                for (std::size_t i = 1; i < k; ++i) {
+                    const double dist = (Y[n] - centres[i]).squaredNorm();
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        best = i;
+                    }
+                }
+                if (assignment[n] != best) {
+                    assignment[n] = best;
+                    changed = true;
+                }
+                sums[best].noalias() += Y[n];
+                ++counts[best];
+            }
+
+            double shift = 0.0;
+            for (std::size_t i = 0; i < k; ++i) {
+                if (counts[i] == 0) continue;
+                Eigen::VectorXd next = sums[i] / static_cast<double>(counts[i]);
+                shift += (next - centres[i]).squaredNorm();
+                centres[i] = std::move(next);
+            }
+
+            if (!changed || std::sqrt(shift) <= tol) break;
+        }
+    }
+
+    void initialize_kmeans_pp(uint64_t seed,
+                              bool run_lloyd_refinement,
+                              int lloyd_max_iter,
+                              double lloyd_tol) {
+        const std::size_t k = k_();
+        const std::size_t d = obs->d;
+        const auto& Y = *observed_data;
+        const std::size_t N = Y.size();
+        if (N < k) throw std::runtime_error("initialize_kmeans_pp: N < k");
+
+        std::vector<Eigen::VectorXd> centres = kmeans_pp_seed_centres_(seed);
+        if (run_lloyd_refinement) {
+            refine_centres_lloyd_(centres, lloyd_max_iter, lloyd_tol);
+        }
+
         Eigen::VectorXd y_mean = Eigen::VectorXd::Zero(d);
         for (const auto& y : Y) y_mean += y;
         y_mean /= static_cast<double>(N);
@@ -676,9 +980,17 @@ public:
 
         obs->d  = d;
         obs->mu = std::move(centres);
-        obs->Sigma.assign(k, Sg / static_cast<double>(k));
-        for (std::size_t i = 0; i < k; ++i)
-            obs->Sigma[i] += 1e-3 * Eigen::MatrixXd::Identity(d, d);
+        if (obs->diagonal_covariance) {
+            const Eigen::VectorXd diag =
+                Sg.diagonal() / static_cast<double>(k)
+                + 1e-3 * Eigen::VectorXd::Ones(d);
+            Eigen::MatrixXd S0 = diag.asDiagonal();
+            obs->Sigma.assign(k, S0);
+        } else {
+            obs->Sigma.assign(k, Sg / static_cast<double>(k));
+            for (std::size_t i = 0; i < k; ++i)
+                obs->Sigma[i] += 1e-3 * Eigen::MatrixXd::Identity(d, d);
+        }
 
         initialize_q_from_rate_();
         stm->root_prior = { std::vector<double>(k, 1.0 / static_cast<double>(k)) };
@@ -717,9 +1029,17 @@ public:
 
         obs->d  = d;
         obs->mu = std::move(centres);
-        obs->Sigma.assign(k, Sg / static_cast<double>(k));
-        for (std::size_t i = 0; i < k; ++i)
-            obs->Sigma[i] += 1e-3 * Eigen::MatrixXd::Identity(d, d);
+        if (obs->diagonal_covariance) {
+            const Eigen::VectorXd diag =
+                Sg.diagonal() / static_cast<double>(k)
+                + 1e-3 * Eigen::VectorXd::Ones(d);
+            Eigen::MatrixXd S0 = diag.asDiagonal();
+            obs->Sigma.assign(k, S0);
+        } else {
+            obs->Sigma.assign(k, Sg / static_cast<double>(k));
+            for (std::size_t i = 0; i < k; ++i)
+                obs->Sigma[i] += 1e-3 * Eigen::MatrixXd::Identity(d, d);
+        }
 
         initialize_q_from_rate_();
         stm->root_prior = { std::vector<double>(k, 1.0 / static_cast<double>(k)) };
@@ -729,6 +1049,197 @@ public:
         obs->build();
     }
 };
+
+struct complete_data_objective_record {
+    int    iteration = 0;
+    double root      = 0.0;
+    double ctmc      = 0.0;
+    double emission  = 0.0;
+    double weighted_ctmc     = 0.0;
+    double weighted_emission = 0.0;
+    double total     = 0.0;
+};
+
+struct phylo_gmm_em_output {
+    phylocore::optimize::estimation_results results;
+    std::vector<complete_data_objective_record> complete_data_objective_trace;
+};
+
+double weighted_log_sum(const Eigen::VectorXd& weights,
+                        const std::vector<double>& probs) {
+    double total = 0.0;
+    for (Eigen::Index i = 0; i < weights.size(); ++i) {
+        const double w = weights[i];
+        if (w == 0.0) continue;
+        const double p = probs[static_cast<std::size_t>(i)];
+        if (p <= 0.0) return -std::numeric_limits<double>::infinity();
+        total += w * std::log(p);
+    }
+    return total;
+}
+
+double complete_root_objective(
+    const phylo_gmm_problem& problem,
+    const phylo_gmm_problem::suff_stats_type& ss)
+{
+    return weighted_log_sum(ss.root_gamma_total, problem.stm->root_prior[0]);
+}
+
+double complete_ctmc_objective(
+    const phylo_gmm_problem& problem,
+    const phylo_gmm_problem::suff_stats_type& ss)
+{
+    const std::size_t k = problem.k_();
+    double jump = 0.0;
+    for (std::size_t i = 0; i < k; ++i) {
+        for (std::size_t j = 0; j < k; ++j) {
+            if (i == j) continue;
+	            const double Nij = ss.N_total(
+	                static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+	            if (std::abs(Nij) <= expected_transition_tol) continue;
+	            if (Nij < 0.0) continue;
+	            const double qij = problem.stm->Q(
+	                static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j));
+            if (qij <= 0.0) return -std::numeric_limits<double>::infinity();
+            jump += Nij * std::log(qij);
+        }
+    }
+
+    double dwell = 0.0;
+    for (std::size_t i = 0; i < k; ++i) {
+        dwell += ss.T_total[static_cast<Eigen::Index>(i)]
+               * problem.stm->Q(static_cast<Eigen::Index>(i),
+                                static_cast<Eigen::Index>(i));
+    }
+    return jump + dwell;
+}
+
+double complete_emission_objective(phylo_gmm_problem& problem) {
+    const std::size_t num_sites = problem.stm->sites_latent_states.size();
+    double total = 0.0;
+
+    for (std::size_t ti = 0; ti < problem.trees.size(); ++ti) {
+        const tree& t = *problem.trees[ti];
+        for (std::size_t v = 0; v < t.num_nodes; ++v) {
+            if (t.tree.out_degree(static_cast<int>(v)) != 0) continue;
+            const std::size_t taxa_id = t.tree[static_cast<int>(v)].data;
+            const Eigen::VectorXd& y = (*problem.observed_data)[taxa_id];
+            const int hard_label =
+                (!problem.metadata->hard_labels.empty()
+                 && taxa_id < problem.metadata->hard_labels.size())
+                    ? problem.metadata->hard_labels[taxa_id]
+                    : -1;
+
+            for (std::size_t c = 0; c < num_sites; ++c) {
+                const std::size_t alpha =
+                    problem.stm->sites_latent_states[c].alphabet_size;
+                auto log_gamma = problem.leaf_posterior(ti, v, c);
+                for (std::size_t i = 0; i < alpha; ++i) {
+                    const double r = std::exp(log_gamma[i]);
+                    if (r == 0.0) continue;
+                    if (hard_label >= 0) {
+                        if (static_cast<int>(i) != hard_label)
+                            return -std::numeric_limits<double>::infinity();
+                        continue;  // log delta(label) = 0
+                    }
+                    total += r * problem.obs->compute_log_emission_probability(
+                        (*problem.node_data[ti])[v], i, c, y);
+                }
+            }
+        }
+    }
+    return total;
+}
+
+complete_data_objective_record compute_complete_data_objective_record(
+    phylo_gmm_problem& problem,
+    const phylo_gmm_problem::suff_stats_type& ss,
+    int iteration)
+{
+    complete_data_objective_record rec;
+    rec.iteration = iteration;
+    rec.root      = complete_root_objective(problem, ss);
+    rec.ctmc      = complete_ctmc_objective(problem, ss);
+    rec.emission  = complete_emission_objective(problem);
+    rec.weighted_ctmc = problem.ctmc_weight * rec.ctmc;
+    rec.weighted_emission = problem.emission_weight * rec.emission;
+    rec.total = rec.root + rec.weighted_ctmc + rec.weighted_emission;
+    return rec;
+}
+
+phylo_gmm_em_output run_phylo_gmm_em(
+    phylo_gmm_problem& problem,
+    phylocore::optimize::em_options opts)
+{
+    problem.validate_disjoint_taxa();
+
+    double prev_llh = problem.log_likelihood();
+    std::vector<double> log_likelihood_trace;
+    log_likelihood_trace.reserve(
+        static_cast<std::size_t>(opts.max_iter > 0 ? opts.max_iter : 0) + 1);
+    log_likelihood_trace.push_back(prev_llh);
+
+    std::vector<complete_data_objective_record> complete_trace;
+    complete_trace.reserve(
+        static_cast<std::size_t>(opts.max_iter > 0 ? opts.max_iter : 0));
+
+    int  iter_count = 0;
+    bool converged  = false;
+
+    for (int iter = 0; iter < opts.max_iter; ++iter) {
+        for (std::size_t i = 0; i < problem.trees.size(); ++i) {
+            phylocore::compute_edge_inside_log_likelihood(
+                *problem.stm, *problem.trees[i],
+                problem.inside_buffer(i), problem.edge_inside_buffer(i),
+                *problem.node_data[i]);
+            phylocore::compute_outside_log_likelihood(
+                *problem.stm, *problem.trees[i],
+                problem.edge_inside_buffer(i), problem.outside_buffer(i),
+                *problem.node_data[i]);
+        }
+
+        auto suff = problem.compute_suff_stats();
+        problem.m_step(suff);
+        ++iter_count;
+        complete_trace.push_back(
+            compute_complete_data_objective_record(problem, suff, iter_count));
+
+        double new_llh = problem.log_likelihood();
+        log_likelihood_trace.push_back(new_llh);
+
+        if (opts.verbose) {
+            std::cerr << "[run_phylo_gmm_em] iter " << iter_count
+                      << ": log L = " << new_llh
+                      << "  (delta = " << (new_llh - prev_llh) << ")\n";
+        }
+
+        if (opts.warn_on_decrease && new_llh < prev_llh - 1e-9) {
+            std::cerr << "[run_phylo_gmm_em] WARNING: log-L decreased at iter "
+                      << iter_count << ": " << prev_llh
+                      << " -> " << new_llh
+                      << "  (delta = " << (new_llh - prev_llh) << ")\n";
+        }
+
+        double rel_delta = (new_llh - prev_llh) / std::abs(prev_llh);
+        if (rel_delta >= 0.0 && rel_delta < opts.rel_tol) {
+            prev_llh  = new_llh;
+            converged = true;
+            break;
+        }
+        prev_llh = new_llh;
+    }
+
+    phylo_gmm_em_output out;
+    out.results.params               = problem.get_params();
+    out.results.log_likelihood       = prev_llh;
+    out.results.log_likelihood_trace = std::move(log_likelihood_trace);
+    out.results.num_iterations       = iter_count;
+    out.results.converged            = converged;
+    out.results.trees.reserve(problem.trees.size());
+    for (const auto* t : problem.trees) out.results.trees.push_back(*t);
+    out.complete_data_objective_trace = std::move(complete_trace);
+    return out;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV observation parser
@@ -793,26 +1304,41 @@ obs_csv_result parse_observations_csv(const std::string& path) {
 
 struct restart_record {
     std::string                  label;
-    int                          seed;
-    double                       log_likelihood;
-    bool                         converged;
-    int                          iterations;
+    int                          seed = 0;
+    double                       initial_log_likelihood = 0.0;
+    double                       log_likelihood = 0.0;
+    bool                         converged = false;
+    int                          iterations = 0;
+    std::vector<double>          log_likelihood_trace;
+    std::vector<complete_data_objective_record>
+                                 complete_data_objective_trace;
+    std::vector<Eigen::VectorXd> initial_mu;
+    std::vector<Eigen::MatrixXd> initial_Sigma;
+    Eigen::MatrixXd              initial_Q;
+    Eigen::VectorXd              initial_pi;
     std::vector<Eigen::VectorXd> mu;
     std::vector<Eigen::MatrixXd> Sigma;
     Eigen::MatrixXd              Q;
     Eigen::VectorXd              pi;
 };
 
-// Bundle of parameters loaded from --init_emission_json. mu and Sigma are
-// required (Sigma is built from sigma_diag); Q and pi are optional (when
-// std::nullopt the caller falls back to the binary's normal init for that
-// field). When present, this struct replaces the kmeans++/random init of
-// (μ, Σ) and optionally (Q, π) for that restart.
+// Bundle of parameters loaded from --init_params_json / --init_emission_json.
+// mu and Sigma are required; Q and pi are optional (when std::nullopt the
+// caller falls back to the binary's normal init for that field). When present,
+// this struct replaces the kmeans++/random init of (μ, Σ) and optionally
+// (Q, π) for that restart.
 struct init_emission_bundle {
     std::vector<Eigen::VectorXd>  mu;     // K vectors of length d
-    std::vector<Eigen::MatrixXd>  Sigma;  // K diagonal d×d matrices (+ ridge)
+    std::vector<Eigen::MatrixXd>  Sigma;  // K d×d covariance matrices
     std::optional<Eigen::MatrixXd> Q;     // K×K (optional)
     std::optional<Eigen::VectorXd> pi;    // K (optional)
+};
+
+struct restart_job {
+    std::size_t index = 0;
+    std::string label;
+    int seed = 0;
+    bool use_kmeans_pp = true;
 };
 
 restart_record run_em_restart(std::vector<tree*>&               trees,
@@ -823,18 +1349,26 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               const std::string&                 label,
                               int                                seed,
                               bool                               use_kmeans_pp,
+                              bool                               kmeans_standard,
+                              int                                kmeans_max_iter,
+                              double                             kmeans_tol,
                               bool                               fix_pi,
                               double                             tol,
                               int                                max_iter,
                               double                             q_init_rate,
+                              double                             ctmc_weight,
+                              double                             emission_weight,
                               std::optional<double>              fix_q_rate    = std::nullopt,
                               bool                               fix_emission  = false,
+                              bool                               diagonal_covariance = false,
                               std::optional<Eigen::MatrixXd>     fix_q_matrix  = std::nullopt,
                               const init_emission_bundle*        init_emission = nullptr,
                               bool                               verbose       = false) {
     ctmc_model stm;
+    stm.complete_data_weight = ctmc_weight;
     gmm_observation_model obs;
     obs.d = d;
+    obs.diagonal_covariance = diagonal_covariance;
 
     stm.Q = Eigen::MatrixXd::Identity(static_cast<Eigen::Index>(k),
                                        static_cast<Eigen::Index>(k));
@@ -865,24 +1399,30 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     problem.obs           = &obs;
     problem.observed_data = &observed_data;
     problem.metadata      = &metadata;
+    problem.ctmc_weight   = ctmc_weight;
+    problem.emission_weight = emission_weight;
     for (std::size_t i = 0; i < trees.size(); ++i) {
         problem.trees.push_back(trees[i]);
         problem.node_data.push_back(&nds[i]);
     }
 
-    // CLI fix_pi=1 means hold pi = 1/k constant — we map that to
-    // stationary_pi=false (so the EM doesn't recompute pi from Q) and
-    // post-init clobber root_prior to 1/k. Default (fix_pi=0) uses
-    // stationary_pi=true, so pi tracks the stationary distribution of Q.
+    // CLI fix_pi=1 is the legacy spelling for --pi_mode free. We map that to
+    // stationary_pi=false so EM updates pi from root posteriors instead of
+    // deriving it from Q. Without a JSON pi, the free-pi path starts at 1/k.
+    // Default (fix_pi=0) uses stationary_pi=true, so pi tracks the stationary
+    // distribution of Q.
     problem.stationary_pi = !fix_pi;
     problem.q_init_rate_  = q_init_rate;
 
     if (init_emission) {
-        // --init_emission_json: skip kmeans++/random init. Install (μ, Σ) from
-        // JSON; install Q from JSON if present, otherwise build the standard
-        // uniform-exit-rate Q from q_init_rate; install π from JSON if
-        // present, otherwise uniform. The same EM machinery (compute_suff
-        // stats / m_step / set_params) runs on top of this init unchanged.
+        // --init_params_json / --init_emission_json: skip kmeans++/random
+        // init. Install (μ, Σ) from JSON; install Q from JSON if present,
+        // otherwise build the standard uniform-exit-rate Q from q_init_rate;
+        // install π from JSON if present, otherwise uniform. The same EM
+        // machinery (compute_suff_stats / m_step / set_params) runs on top of
+        // this init unchanged. In stationary pi mode, apply_state_and_rebuild_
+        // will derive pi from Q; use --pi_mode free to use a supplied pi as a
+        // true starting point.
         obs.d     = d;
         obs.mu    = init_emission->mu;
         obs.Sigma = init_emission->Sigma;
@@ -902,28 +1442,39 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
         }
         problem.apply_state_and_rebuild_();
     } else if (use_kmeans_pp) {
-        problem.initialize_kmeans_pp(static_cast<uint64_t>(seed));
+        problem.initialize_kmeans_pp(static_cast<uint64_t>(seed),
+                                     kmeans_standard,
+                                     kmeans_max_iter,
+                                     kmeans_tol);
     } else {
         problem.initialize_random(static_cast<uint64_t>(seed));
     }
 
-    // --fix_q / --fix_q_json: clobber Q with the given matrix and pin it. Must
-    // happen BEFORE the --fix_pi override below so the stationary-pi
-    // recomputation inside apply_state_and_rebuild_ doesn't undo --fix_pi.
+    // --fix_q / --fix_q_json: clobber Q with the given matrix and pin it. In
+    // stationary-pi mode, derive pi from this fixed Q once before setting
+    // fix_Q=true; subsequent rebuilds can then skip the recompute.
     // fix_q_matrix (from --fix_q_json) takes precedence over fix_q_rate
     // (from --fix_q <rate>); the CLI parser already enforces they're not
     // both set.
     if (fix_q_matrix) {
         stm.Q = *fix_q_matrix;
+        if (problem.stationary_pi) {
+            stm.build();
+            problem.set_pi_on_root_prior_(problem.extract_stationary_pi_());
+        }
         problem.fix_Q = true;
         problem.apply_state_and_rebuild_();
     } else if (fix_q_rate) {
         stm.Q = make_uniform_exit_q(k, *fix_q_rate);
+        if (problem.stationary_pi) {
+            stm.build();
+            problem.set_pi_on_root_prior_(problem.extract_stationary_pi_());
+        }
         problem.fix_Q = true;
         problem.apply_state_and_rebuild_();
     }
 
-    if (fix_pi) {
+    if (fix_pi && !(init_emission && init_emission->pi)) {
         std::vector<double> uniform_pi(k, 1.0 / static_cast<double>(k));
         stm.root_prior = { uniform_pi };
     }
@@ -933,34 +1484,65 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     // and takes effect inside compute_inside_log_likelihood.
     if (fix_emission) problem.fix_emission = true;
 
+    Eigen::VectorXd initial_pi_rec(static_cast<Eigen::Index>(k));
+    for (std::size_t i = 0; i < k; ++i)
+        initial_pi_rec[static_cast<Eigen::Index>(i)] = stm.root_prior[0][i];
+
+    const std::vector<Eigen::VectorXd> initial_mu    = obs.mu;
+    const std::vector<Eigen::MatrixXd> initial_Sigma = obs.Sigma;
+    const Eigen::MatrixXd              initial_Q     = stm.Q;
+    const Eigen::VectorXd              initial_pi    = initial_pi_rec;
+    const double initial_log_likelihood = problem.log_likelihood();
+
     phylocore::optimize::em_options opts;
     opts.rel_tol          = tol;
     opts.max_iter         = max_iter;
     opts.verbose          = verbose;
     opts.warn_on_decrease = false;
 
-    auto results = phylocore::optimize::em(problem, opts);
+    auto em_out = run_phylo_gmm_em(problem, opts);
+    auto& results = em_out.results;
 
     Eigen::VectorXd pi_rec(static_cast<Eigen::Index>(k));
     for (std::size_t i = 0; i < k; ++i)
         pi_rec[static_cast<Eigen::Index>(i)] = stm.root_prior[0][i];
 
     restart_record r;
-    r.label          = label;
-    r.seed           = seed;
-    r.log_likelihood = results.log_likelihood;
-    r.converged      = results.converged;
-    r.iterations     = results.num_iterations;
-    r.mu             = obs.mu;
-    r.Sigma          = obs.Sigma;
-    r.Q              = stm.Q;
-    r.pi             = pi_rec;
+    r.label                  = label;
+    r.seed                   = seed;
+    r.initial_log_likelihood = initial_log_likelihood;
+    r.log_likelihood         = results.log_likelihood;
+    r.converged              = results.converged;
+    r.iterations             = results.num_iterations;
+    r.log_likelihood_trace   = results.log_likelihood_trace;
+    r.complete_data_objective_trace =
+        std::move(em_out.complete_data_objective_trace);
+    r.initial_mu             = initial_mu;
+    r.initial_Sigma          = initial_Sigma;
+    r.initial_Q              = initial_Q;
+    r.initial_pi             = initial_pi;
+    r.mu                     = obs.mu;
+    r.Sigma                  = obs.Sigma;
+    r.Q                      = stm.Q;
+    r.pi                     = pi_rec;
     return r;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JSON dump
 // ─────────────────────────────────────────────────────────────────────────────
+
+void dump_json_number(std::ostream& os, double v) {
+    if (std::isfinite(v)) {
+        os << v;
+    } else if (std::isnan(v)) {
+        os << "NaN";
+    } else if (v > 0.0) {
+        os << "Infinity";
+    } else {
+        os << "-Infinity";
+    }
+}
 
 void dump_matrix(std::ostream& os, const Eigen::MatrixXd& M) {
     os << "[";
@@ -981,6 +1563,59 @@ void dump_vec(std::ostream& os, const Eigen::VectorXd& v) {
     for (Eigen::Index i = 0; i < v.size(); ++i) {
         if (i > 0) os << ", ";
         os << v[i];
+    }
+    os << "]";
+}
+
+void dump_double_vector(std::ostream& os, const std::vector<double>& values) {
+    os << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) os << ", ";
+        os << values[i];
+    }
+    os << "]";
+}
+
+void dump_complete_data_objective_trace(
+    std::ostream& os,
+    const std::vector<complete_data_objective_record>& values)
+{
+    os << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) os << ", ";
+        const auto& r = values[i];
+        os << "{\"iteration\":" << r.iteration
+           << ",\"root\":";
+        dump_json_number(os, r.root);
+        os << ",\"ctmc\":";
+        dump_json_number(os, r.ctmc);
+        os << ",\"emission\":";
+        dump_json_number(os, r.emission);
+        os << ",\"weighted_ctmc\":";
+        dump_json_number(os, r.weighted_ctmc);
+        os << ",\"weighted_emission\":";
+        dump_json_number(os, r.weighted_emission);
+        os << ",\"total\":";
+        dump_json_number(os, r.total);
+        os << "}";
+    }
+    os << "]";
+}
+
+void dump_vector_list(std::ostream& os, const std::vector<Eigen::VectorXd>& values) {
+    os << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) os << ", ";
+        dump_vec(os, values[i]);
+    }
+    os << "]";
+}
+
+void dump_matrix_list(std::ostream& os, const std::vector<Eigen::MatrixXd>& values) {
+    os << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) os << ", ";
+        dump_matrix(os, values[i]);
     }
     os << "]";
 }
@@ -1022,9 +1657,13 @@ posterior_outputs compute_posteriors(
     std::size_t                    k,
     std::size_t                    d,
     bool                           fix_pi,
+    bool                           diagonal_covariance,
+    double                         ctmc_weight,
+    double                         emission_weight,
     const restart_record&         best)
 {
     ctmc_model stm;
+    stm.complete_data_weight = ctmc_weight;
     stm.Q = best.Q;
     // Pre-install π as root_prior so ctmc_model::build() doesn't overwrite it
     // with uniform (its empty-or-wrong-size fallback).
@@ -1038,6 +1677,7 @@ posterior_outputs compute_posteriors(
 
     gmm_observation_model obs;
     obs.d     = d;
+    obs.diagonal_covariance = diagonal_covariance;
     obs.mu    = best.mu;
     obs.Sigma = best.Sigma;
     obs.sites_latent_states = stm.sites_latent_states;
@@ -1052,6 +1692,8 @@ posterior_outputs compute_posteriors(
     prob.obs           = &obs;
     prob.observed_data = &observed_data;
     prob.metadata      = &metadata;
+    prob.ctmc_weight   = ctmc_weight;
+    prob.emission_weight = emission_weight;
     for (std::size_t i = 0; i < trees.size(); ++i) {
         prob.trees.push_back(trees[i]);
         prob.node_data.push_back(&nds[i]);
@@ -1154,6 +1796,14 @@ struct cli_args {
     bool        fix_pi       = true;   // default pi_mode=free (fix_pi=true => stationary_pi=false)
     int         n_init       = 10;
     bool        verbose      = false;
+    double      ctmc_weight  = 1.0;
+    double      emission_weight = 1.0;
+    bool        kmeans_standard = false;
+    int         kmeans_max_iter = 100;
+    double      kmeans_tol      = 1e-6;
+    bool        diagonal_covariance = false;
+    bool        parallel_restarts   = false;
+    int         restart_threads     = 0;  // 0 means hardware_concurrency
 
     // Mode selectors. At most one of {fix_q_rate/fix_q_json, fix_labels_csv,
     // bayes_opt} may be set. --fix_emission may be combined with --fix_q
@@ -1166,7 +1816,8 @@ struct cli_args {
     std::optional<double>      true_q_exit_rate;       // --true_q_exit_rate
     std::optional<double>      true_simplex_scale;     // --true_simplex_scale
     std::optional<std::string> bayes_opt_truth_json;   // --bayes_opt_truth_json
-    std::optional<std::string> init_emission_json;     // --init_emission_json
+    std::optional<std::string> init_params_json;       // --init_params_json
+    std::optional<std::string> init_emission_json;     // legacy alias
 };
 
 void print_usage(const char* prog) {
@@ -1178,9 +1829,28 @@ void print_usage(const char* prog) {
       "Usage (joint inference / mode selection, flag-based):\n"
       "  " << prog << " --k K [--max_iter N] [--tol T] [--q_init_rate R] \\\n"
       "                [--pi_mode stationary|free] [--n_init N] [--verbose] \\\n"
+      "                [--ctmc_weight W_C] [--emission_weight W_E] \\\n"
+      "                [--kmeans_init seeding|standard] \\\n"
+      "                [--init_params_json params.json] \\\n"
       "                --tree T1 --obs O1 [--tree T2 --obs O2 ...] \\\n"
       "                [mode flag]\n"
       "\n"
+      "K-means++ initialization (default 'seeding'):\n"
+      "  --kmeans_init seeding   choose k-means++ centers only; no Lloyd steps\n"
+      "  --kmeans_init standard  choose k-means++ centers, then run Lloyd k-means\n"
+      "                          before EM uses the centers as initial μ\n"
+      "  --kmeans_max_iter N     Lloyd iteration cap for --kmeans_init standard\n"
+      "  --kmeans_tol T          Lloyd convergence tolerance on center movement\n"
+      "\n"
+      "Performance / covariance options:\n"
+      "  --diag_covariance       fit diagonal Σ_i instead of full d×d covariance\n"
+      "                          matrices. Equivalent spelling: --diagonal_covariance.\n"
+      "  --parallel_restarts [N] run independent restarts concurrently. Optional N\n"
+      "                          caps worker threads; omit or use 0 for hardware count.\n"
+      "  --restart_threads N     set the parallel restart worker cap and enable\n"
+      "                          --parallel_restarts.\n"
+      "\n"
+      "Diagnostics:\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
       "\n"
       "Pi mode (default 'free'):\n"
@@ -1189,6 +1859,15 @@ void print_usage(const char* prog) {
       "  --pi_mode free          pi initialized uniformly, then freely fit each\n"
       "                          M-step from the root posteriors.\n"
       "  --fix_pi 0|1            DEPRECATED alias. 0==stationary, 1==free.\n"
+      "\n"
+      "Weighted complete-data objective (defaults both to 1):\n"
+      "  --ctmc_weight W_C       weight on the complete CTMC path term\n"
+      "  --emission_weight W_E   weight on the Gaussian emission term\n"
+      "  --w_C / --w_E           aliases for the two options above\n"
+      "                          Weights must be finite and strictly positive.\n"
+      "                          With non-unit weights, JSON field log_likelihood\n"
+      "                          is the generalized (unnormalized) marginal\n"
+      "                          log-objective, used for convergence/restarts.\n"
       "\n"
       "Mode flags (at most one of the first three, plus optional --fix_emission):\n"
       "  --fix_q <rate>          Q held at uniform-exit-rate matrix; EM on μ, Σ, π\n"
@@ -1204,29 +1883,34 @@ void print_usage(const char* prog) {
       "                          single inside-outside pass yields posteriors.\n"
       "                          k=4 d=3 only (simplex hardcoded).\n"
       "  --bayes_opt --bayes_opt_truth_json <path>\n"
-      "                          As above, but Q (K×K), mu (K×d), sigma_diag (K×d),\n"
-      "                          and optional pi (K) are read from JSON. Σ is built\n"
-      "                          per cluster as diag(sigma_diag[k]). pi defaults to\n"
-      "                          1/k if absent. Replaces --true_q_exit_rate and\n"
+      "                          As above, but Q (K×K), mu (K×d), covariance\n"
+      "                          (Sigma K×d×d, or sigma_diag K×d), and optional\n"
+      "                          pi (K) are read from JSON. pi defaults to 1/k if\n"
+      "                          absent. Replaces --true_q_exit_rate and\n"
       "                          --true_simplex_scale for arbitrary K, d, and μ.\n"
       "\n"
       "Init override (combinable with EM modes, not with --bayes_opt / --fix_labels):\n"
+      "  --init_params_json <path>\n"
+      "                          Use user-defined (μ, Σ) — and optionally (Q, π) —\n"
+      "                          as the EM starting point instead of kmeans++/random\n"
+      "                          init. Q defaults to uniform-exit-rate from\n"
+      "                          --q_init_rate if absent; π defaults to 1/k. In\n"
+      "                          --pi_mode stationary, π is derived from Q; use\n"
+      "                          --pi_mode free to honor a JSON π as the start.\n"
+      "                          EM then proceeds normally (updates Q, μ, Σ, π — or\n"
+      "                          whatever isn't frozen by --fix_q / --fix_q_json /\n"
+      "                          --fix_emission). With --n_init > 1, every restart\n"
+      "                          uses the same JSON init (deterministic).\n"
       "  --init_emission_json <path>\n"
-      "                          Use (μ, Σ) — and optionally (Q, π) — from JSON as\n"
-      "                          the EM starting point instead of kmeans++/random\n"
-      "                          init. Σ is built per cluster as diag(sigma_diag[k])\n"
-      "                          + small ridge. Q defaults to uniform-exit-rate from\n"
-      "                          --q_init_rate if absent in JSON; π defaults to 1/k.\n"
-      "                          mu and sigma_diag are required keys; Q and pi are\n"
-      "                          optional. EM then proceeds normally (updates Q, μ,\n"
-      "                          Σ, π — or whatever isn't frozen by --fix_q /\n"
-      "                          --fix_q_json / --fix_emission). With --n_init > 1,\n"
-      "                          every restart uses the same JSON init (deterministic).\n"
+      "                          Deprecated alias for --init_params_json. Retains\n"
+      "                          compatibility with older files that provide\n"
+      "                          mu + sigma_diag (small ridge added to sigma_diag).\n"
       "\n"
       "JSON schema (single file works for --fix_q_json, --bayes_opt_truth_json, or\n"
-      "--init_emission_json; extra keys are tolerated):\n"
+      "--init_params_json; extra keys are tolerated):\n"
       "  {\"Q\": [[K x K]], \"mu\": [[K x d]],\n"
-      "   \"sigma_diag\": [[K x d]], \"pi\": [K]}\n";
+      "   \"Sigma\": [[[d x d], ... K]], \"sigma_diag\": [[K x d]],\n"
+      "   \"pi\": [K]}\n";
 }
 
 bool parse_cli(int argc, char* argv[], cli_args& a) {
@@ -1247,6 +1931,10 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--max_iter")          a.max_iter    = std::stoi(next());
             else if (s == "--tol")               a.tol         = std::stod(next());
             else if (s == "--q_init_rate")       a.q_init_rate = std::stod(next());
+            else if (s == "--ctmc_weight" || s == "--w_C")
+                a.ctmc_weight = std::stod(next());
+            else if (s == "--emission_weight" || s == "--w_E")
+                a.emission_weight = std::stod(next());
             else if (s == "--pi_mode") {
                 std::string m = next();
                 if      (m == "stationary") a.fix_pi = false;
@@ -1265,7 +1953,30 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             }
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
             else if (s == "--verbose")           a.verbose          = true;
+            else if (s == "--kmeans_init") {
+                std::string m = next();
+                if      (m == "seeding")  a.kmeans_standard = false;
+                else if (m == "standard") a.kmeans_standard = true;
+                else throw std::runtime_error(
+                    "--kmeans_init must be 'seeding' or 'standard'. Got: '" + m + "'");
+            }
+            else if (s == "--kmeans_max_iter")   a.kmeans_max_iter = std::stoi(next());
+            else if (s == "--kmeans_tol")        a.kmeans_tol      = std::stod(next());
             else if (s == "--fix_emission")      a.fix_emission     = true;
+            else if (s == "--diag_covariance" ||
+                     s == "--diagonal_covariance") {
+                a.diagonal_covariance = true;
+            }
+            else if (s == "--parallel_restarts") {
+                a.parallel_restarts = true;
+                if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                    a.restart_threads = std::stoi(argv[++i]);
+                }
+            }
+            else if (s == "--restart_threads") {
+                a.restart_threads = std::stoi(next());
+                a.parallel_restarts = true;
+            }
             else if (s == "--fix_q")             a.fix_q_rate       = std::stod(next());
             else if (s == "--fix_q_json")        a.fix_q_json       = next();
             else if (s == "--fix_labels")        a.fix_labels_csv   = next();
@@ -1273,6 +1984,7 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--true_q_exit_rate")  a.true_q_exit_rate = std::stod(next());
             else if (s == "--true_simplex_scale") a.true_simplex_scale = std::stod(next());
             else if (s == "--bayes_opt_truth_json") a.bayes_opt_truth_json = next();
+            else if (s == "--init_params_json") a.init_params_json = next();
             else if (s == "--init_emission_json") a.init_emission_json = next();
             else throw std::runtime_error("unknown flag: " + s);
         }
@@ -1282,6 +1994,19 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             throw std::runtime_error("at least one --tree/--obs pair required");
         if (a.k == 0)
             throw std::runtime_error("--k is required");
+        if (a.n_init < 1)
+            throw std::runtime_error("--n_init must be >= 1");
+        if (a.kmeans_max_iter < 0)
+            throw std::runtime_error("--kmeans_max_iter must be >= 0");
+        if (a.kmeans_tol < 0.0)
+            throw std::runtime_error("--kmeans_tol must be >= 0");
+        if (a.restart_threads < 0)
+            throw std::runtime_error("--restart_threads must be >= 0");
+        if (!std::isfinite(a.ctmc_weight) || a.ctmc_weight <= 0.0)
+            throw std::runtime_error("--ctmc_weight/--w_C must be finite and > 0");
+        if (!std::isfinite(a.emission_weight) || a.emission_weight <= 0.0)
+            throw std::runtime_error(
+                "--emission_weight/--w_E must be finite and > 0");
 
         // Mode-flag validation: at most one of the three primary mode flags.
         // --fix_q_json is an alternative form of --fix_q (treated as the same
@@ -1297,22 +2022,27 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
         if (n_modes > 1)
             throw std::runtime_error(
                 "--fix_q/--fix_q_json, --fix_labels, --bayes_opt are mutually exclusive");
-        // --init_emission_json: incompatible with --bayes_opt (which doesn't
-        // run EM) and --fix_labels (which clamps μ, Σ from kmeans++ init —
+        // --init_params_json: incompatible with --bayes_opt (which doesn't run
+        // EM) and --fix_labels (which clamps μ, Σ from kmeans++ init —
         // semantically incompatible with reading them from JSON). Compatible
         // with --fix_q, --fix_q_json, and --fix_emission: in those cases the
         // JSON simply provides the initial values that are then either frozen
         // or updated by EM, depending on the freeze flags.
-        if (a.init_emission_json) {
+        const bool has_init_json =
+            a.init_params_json.has_value() || a.init_emission_json.has_value();
+        if (a.init_params_json && a.init_emission_json)
+            throw std::runtime_error(
+                "--init_params_json and --init_emission_json are aliases; use only one");
+        if (has_init_json) {
             if (a.bayes_opt)
                 throw std::runtime_error(
-                    "--init_emission_json is incompatible with --bayes_opt");
+                    "--init_params_json is incompatible with --bayes_opt");
             if (a.bayes_opt_truth_json)
                 throw std::runtime_error(
-                    "--init_emission_json is incompatible with --bayes_opt_truth_json");
+                    "--init_params_json is incompatible with --bayes_opt_truth_json");
             if (a.fix_labels_csv)
                 throw std::runtime_error(
-                    "--init_emission_json is incompatible with --fix_labels");
+                    "--init_params_json is incompatible with --fix_labels");
         }
         if (a.bayes_opt) {
             // --bayes_opt_truth_json supersedes --true_q_exit_rate / --true_simplex_scale.
@@ -1348,7 +2078,23 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
     if (argc > 6) a.q_init_rate = std::stod(argv[6]);
     if (argc > 7) a.fix_pi      = std::stoi(argv[7]) != 0;
     if (argc > 8) a.n_init      = std::stoi(argv[8]);
+    if (a.n_init < 1)
+        throw std::runtime_error("n_init must be >= 1");
     return true;
+}
+
+std::size_t resolve_restart_worker_count(const cli_args& A,
+                                         std::size_t restart_job_count) {
+    if (restart_job_count == 0) return 0;
+    if (!A.parallel_restarts || restart_job_count == 1) return 1;
+
+    const unsigned int hw = std::thread::hardware_concurrency();
+    const std::size_t requested =
+        (A.restart_threads > 0)
+            ? static_cast<std::size_t>(A.restart_threads)
+            : static_cast<std::size_t>(hw == 0 ? 1 : hw);
+    return std::max<std::size_t>(
+        1, std::min(requested, restart_job_count));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1411,6 +2157,17 @@ int main_impl(int argc, char* argv[]) {
     const bool        fix_pi      = A.fix_pi;
     const int         n_init      = A.n_init;
     const std::size_t n_trees     = A.tree_files.size();
+    const unsigned int detected_cpus = std::thread::hardware_concurrency();
+    const std::size_t restart_job_count_for_print =
+        A.bayes_opt ? 0 : 2 * static_cast<std::size_t>(n_init);
+    const std::size_t restart_worker_count_for_print =
+        resolve_restart_worker_count(A, restart_job_count_for_print);
+    const std::string restart_worker_mode_for_print =
+        A.bayes_opt
+            ? std::string("no_em_restarts")
+            : ((A.parallel_restarts && restart_job_count_for_print > 1)
+                   ? std::string("parallel")
+                   : std::string("sequential"));
 
     std::cerr << "── phyloGMM (phylocore impl) ────────────────────────────────\n";
     std::cerr << "n_trees  = " << n_trees << "\n";
@@ -1421,6 +2178,38 @@ int main_impl(int argc, char* argv[]) {
     std::cerr << "k        = " << k         << "\n";
     std::cerr << "max_iter = " << max_iter  << ", tol = " << tol << "\n";
     std::cerr << "fix_pi   = " << fix_pi    << ", n_init = " << n_init << "\n";
+    std::cerr << "kmeans_init = "
+              << (A.kmeans_standard ? "standard" : "seeding")
+              << " (lloyd_max_iter = " << A.kmeans_max_iter
+              << ", lloyd_tol = " << A.kmeans_tol << ")\n";
+    std::cerr << "covariance = "
+              << (A.diagonal_covariance ? "diagonal" : "full") << "\n";
+    std::cerr << "parallel_restarts = "
+              << (A.parallel_restarts ? "true" : "false");
+    if (A.parallel_restarts) {
+        std::cerr << " (threads = "
+                  << (A.restart_threads > 0
+                          ? std::to_string(A.restart_threads)
+                          : std::string("hardware"))
+                  << ")";
+    }
+    std::cerr << "\n";
+    std::cerr << "available_cpus = "
+              << (detected_cpus == 0
+                      ? std::string("unknown")
+                      : std::to_string(detected_cpus))
+              << "\n";
+    std::cerr << "restart_jobs = " << restart_job_count_for_print << "\n";
+    std::cerr << "restart_workers = "
+              << restart_worker_count_for_print;
+    if (restart_worker_mode_for_print == "no_em_restarts") {
+        std::cerr << " (no EM restarts)";
+    } else if (restart_worker_mode_for_print == "parallel") {
+        std::cerr << " (parallel)";
+    } else {
+        std::cerr << " (sequential)";
+    }
+    std::cerr << "\n";
     {
         const double effective_rate =
             (q_init_rate > 0.0) ? q_init_rate : 1.0 / static_cast<double>(k);
@@ -1567,6 +2356,7 @@ int main_impl(int argc, char* argv[]) {
     std::vector<restart_record> records;
     restart_record              best_storage;  // only used by --bayes_opt
     const restart_record*       best = nullptr;
+    std::optional<std::size_t>  best_restart_index;
 
     if (A.bayes_opt) {
         std::cerr << "── --bayes_opt mode (no EM) ─────────────────────────────────\n";
@@ -1578,44 +2368,20 @@ int main_impl(int argc, char* argv[]) {
         best_storage.log_likelihood = 0.0;  // filled by compute_posteriors
 
         if (A.bayes_opt_truth_json) {
-            // True (Q, μ, Σ, π) loaded from JSON. Σ_k is built as
-            // diag(sigma_diag[k]); π defaults to uniform if absent.
+            // True (Q, μ, Σ, π) loaded from JSON. Σ may be a full K×d×d
+            // "Sigma" array or compact diagonal "sigma_diag"; π defaults to
+            // uniform if absent.
             std::cerr << "bayes_opt_truth_json = " << *A.bayes_opt_truth_json << "\n";
             const truth_json tj = load_truth_json(*A.bayes_opt_truth_json);
             best_storage.Q = vec2d_to_matrix(tj.Q, k, k, "Q");
-            const Eigen::MatrixXd mu_mat =
-                vec2d_to_matrix(tj.mu, k, d, "mu");
-            const Eigen::MatrixXd sd_mat =
-                vec2d_to_matrix(tj.sigma_diag, k, d, "sigma_diag");
-            best_storage.mu.assign(k, Eigen::VectorXd::Zero(d));
-            best_storage.Sigma.assign(k, Eigen::MatrixXd::Zero(d, d));
-            for (std::size_t i = 0; i < k; ++i) {
-                for (std::size_t j = 0; j < d; ++j) {
-                    best_storage.mu[i][j] =
-                        mu_mat(static_cast<Eigen::Index>(i),
-                               static_cast<Eigen::Index>(j));
-                    const double s = sd_mat(static_cast<Eigen::Index>(i),
-                                            static_cast<Eigen::Index>(j));
-                    if (s <= 0.0)
-                        throw std::runtime_error(
-                            "sigma_diag entries must be > 0 (cluster " +
-                            std::to_string(i) + ", dim " +
-                            std::to_string(j) + ")");
-                    best_storage.Sigma[i](
-                        static_cast<Eigen::Index>(j),
-                        static_cast<Eigen::Index>(j)) = s;
-                }
-            }
-            best_storage.pi = Eigen::VectorXd::Constant(
-                static_cast<Eigen::Index>(k), 1.0 / static_cast<double>(k));
-            if (tj.has_pi) {
-                if (tj.pi.size() != k)
-                    throw std::runtime_error(
-                        "pi: expected " + std::to_string(k) + " entries, got " +
-                        std::to_string(tj.pi.size()));
-                for (std::size_t i = 0; i < k; ++i)
-                    best_storage.pi[static_cast<Eigen::Index>(i)] = tj.pi[i];
-            }
+            validate_ctmc_q(best_storage.Q, "Q");
+            best_storage.mu =
+                vec2d_to_vector_list(tj.mu, k, d, "mu");
+            best_storage.Sigma =
+                sigma_from_json(tj, k, d, A.diagonal_covariance, 0.0,
+                                "--bayes_opt_truth_json");
+            best_storage.pi =
+                normalized_pi_from_json(tj, k, "--bayes_opt_truth_json");
         } else {
             // Legacy convention: Q = uniform-exit-rate(true_q_exit_rate),
             // μ = true_simplex_scale × SIMPLEX_4 (k=4, d=3 hardcoded), Σ = I,
@@ -1648,111 +2414,163 @@ int main_impl(int argc, char* argv[]) {
             std::cerr << "fix_q_json = " << *A.fix_q_json << "\n";
             const truth_json tj = load_truth_json(*A.fix_q_json);
             fix_q_mat = vec2d_to_matrix(tj.Q, k, k, "Q");
+            validate_ctmc_q(*fix_q_mat, "--fix_q_json");
         }
 
-        // --init_emission_json: load once, share across all restarts.
-        // mu and sigma_diag are required; Q and pi are optional (when absent,
-        // run_em_restart falls back to uniform-exit-rate Q and uniform π
-        // respectively). With --n_init > 1, every restart uses the same JSON
-        // init (deterministic; the "restarts" only differ via downstream
-        // randomness, which is absent when init is fully specified).
+        // --init_params_json / --init_emission_json: load once, share across
+        // all restarts. mu and covariance are required; Q and pi are optional
+        // (when absent, run_em_restart falls back to uniform-exit-rate Q and
+        // uniform π respectively). With --n_init > 1, every restart uses the
+        // same JSON init.
+        const std::optional<std::string> init_json_path =
+            A.init_params_json ? A.init_params_json : A.init_emission_json;
+        const bool init_json_is_legacy_alias =
+            A.init_emission_json.has_value();
         std::optional<init_emission_bundle> init_bundle;
-        if (A.init_emission_json) {
-            std::cerr << "init_emission_json = " << *A.init_emission_json << "\n";
-            const truth_json tj = load_truth_json(*A.init_emission_json);
+        if (init_json_path) {
+            std::cerr << (A.init_params_json
+                              ? "init_params_json = "
+                              : "init_emission_json = ")
+                      << *init_json_path << "\n";
+            const truth_json tj = load_truth_json(*init_json_path);
             if (tj.mu.empty())
                 throw std::runtime_error(
-                    "--init_emission_json: required key 'mu' missing or empty");
-            if (tj.sigma_diag.empty())
+                    "--init_params_json: required key 'mu' missing or empty");
+            if (tj.Sigma.empty() && tj.sigma_diag.empty())
                 throw std::runtime_error(
-                    "--init_emission_json: required key 'sigma_diag' missing or empty");
-            const Eigen::MatrixXd mu_mat =
-                vec2d_to_matrix(tj.mu, k, d, "mu");
-            const Eigen::MatrixXd sd_mat =
-                vec2d_to_matrix(tj.sigma_diag, k, d, "sigma_diag");
+                    "--init_params_json: required key 'Sigma' or 'sigma_diag' "
+                    "missing or empty");
             init_emission_bundle b;
-            b.mu.assign(k, Eigen::VectorXd::Zero(d));
-            b.Sigma.assign(k, Eigen::MatrixXd::Zero(d, d));
-            for (std::size_t i = 0; i < k; ++i) {
-                for (std::size_t j = 0; j < d; ++j) {
-                    b.mu[i][static_cast<Eigen::Index>(j)] =
-                        mu_mat(static_cast<Eigen::Index>(i),
-                               static_cast<Eigen::Index>(j));
-                    const double s = sd_mat(static_cast<Eigen::Index>(i),
-                                            static_cast<Eigen::Index>(j));
-                    if (s <= 0.0)
-                        throw std::runtime_error(
-                            "--init_emission_json: sigma_diag entries must be "
-                            "> 0 (cluster " + std::to_string(i) + ", dim " +
-                            std::to_string(j) + ")");
-                    b.Sigma[i](static_cast<Eigen::Index>(j),
-                               static_cast<Eigen::Index>(j)) = s;
-                }
-                b.Sigma[i] += 1e-6 * Eigen::MatrixXd::Identity(d, d);
-            }
-            if (!tj.Q.empty())
+            b.mu = vec2d_to_vector_list(tj.mu, k, d, "mu");
+            b.Sigma = sigma_from_json(
+                tj, k, d, A.diagonal_covariance,
+                init_json_is_legacy_alias ? 1e-6 : 0.0,
+                A.init_params_json ? "--init_params_json"
+                                   : "--init_emission_json");
+            if (!tj.Q.empty()) {
                 b.Q = vec2d_to_matrix(tj.Q, k, k, "Q");
+                validate_ctmc_q(*b.Q,
+                                A.init_params_json ? "--init_params_json"
+                                                   : "--init_emission_json");
+            }
             if (tj.has_pi) {
-                if (tj.pi.size() != k)
-                    throw std::runtime_error(
-                        "--init_emission_json: pi expected " +
-                        std::to_string(k) + " entries, got " +
-                        std::to_string(tj.pi.size()));
-                Eigen::VectorXd pi_v(static_cast<Eigen::Index>(k));
-                for (std::size_t i = 0; i < k; ++i)
-                    pi_v[static_cast<Eigen::Index>(i)] = tj.pi[i];
-                b.pi = pi_v;
+                b.pi = normalized_pi_from_json(
+                    tj, k, A.init_params_json ? "--init_params_json"
+                                              : "--init_emission_json");
             }
             init_bundle = std::move(b);
         }
         const init_emission_bundle* init_ptr =
             init_bundle ? &(*init_bundle) : nullptr;
 
+        std::vector<restart_job> jobs;
+        jobs.reserve(2 * static_cast<std::size_t>(n_init));
         // k-means++ seeds {42, 43, ...} for reproducibility.
         for (int i = 0; i < n_init; ++i) {
-            const int seed = 42 + i;
-            std::cerr << "  kmeans++ " << (i + 1) << "/" << n_init
-                      << "  seed=" << seed << " ... " << std::flush;
-            auto r = run_em_restart(trees, observed_data, metadata, k, d,
-                                    "kmeans++ #" + std::to_string(i),
-                                    seed, /*use_kmeans_pp=*/true, fix_pi,
-                                    tol, max_iter, q_init_rate,
-                                    A.fix_q_rate,
-                                    A.fix_emission
-                                       || A.fix_labels_csv.has_value(),
-                                    fix_q_mat,
-                                    init_ptr,
-                                    A.verbose);
-            std::cerr << "log L = " << r.log_likelihood
-                      << " (iters=" << r.iterations
-                      << ", converged=" << r.converged << ")\n";
-            records.push_back(std::move(r));
+            jobs.push_back(restart_job{
+                jobs.size(), "kmeans++ #" + std::to_string(i),
+                42 + i, true});
         }
         // random seeds {1000, 1001, ...} for reproducibility.
         for (int i = 0; i < n_init; ++i) {
-            const int seed = 1000 + i;
-            std::cerr << "  random   " << (i + 1) << "/" << n_init
-                      << "  seed=" << seed << " ... " << std::flush;
-            auto r = run_em_restart(trees, observed_data, metadata, k, d,
-                                    "random #" + std::to_string(i),
-                                    seed, /*use_kmeans_pp=*/false, fix_pi,
-                                    tol, max_iter, q_init_rate,
-                                    A.fix_q_rate,
-                                    A.fix_emission
-                                       || A.fix_labels_csv.has_value(),
-                                    fix_q_mat,
-                                    init_ptr,
-                                    A.verbose);
-            std::cerr << "log L = " << r.log_likelihood
-                      << " (iters=" << r.iterations
-                      << ", converged=" << r.converged << ")\n";
-            records.push_back(std::move(r));
+            jobs.push_back(restart_job{
+                jobs.size(), "random #" + std::to_string(i),
+                1000 + i, false});
+        }
+
+        auto run_job = [&](const restart_job& job) {
+            return run_em_restart(trees, observed_data, metadata, k, d,
+                                  job.label,
+                                  job.seed, job.use_kmeans_pp,
+                                  A.kmeans_standard,
+                                  A.kmeans_max_iter,
+                                  A.kmeans_tol,
+                                  fix_pi,
+                                  tol, max_iter, q_init_rate,
+                                  A.ctmc_weight,
+                                  A.emission_weight,
+                                  A.fix_q_rate,
+                                  A.fix_emission
+                                     || A.fix_labels_csv.has_value(),
+                                  A.diagonal_covariance,
+                                  fix_q_mat,
+                                  init_ptr,
+                                  A.verbose);
+        };
+
+        records.resize(jobs.size());
+        if (!A.parallel_restarts || jobs.size() <= 1) {
+            for (const auto& job : jobs) {
+                const int ordinal =
+                    job.use_kmeans_pp
+                        ? (job.seed - 42 + 1)
+                        : (job.seed - 1000 + 1);
+                std::cerr << "  " << (job.use_kmeans_pp ? "kmeans++" : "random  ")
+                          << " " << ordinal << "/" << n_init
+                          << "  seed=" << job.seed << " ... " << std::flush;
+                auto r = run_job(job);
+                std::cerr << "log L = " << r.log_likelihood
+                          << " (iters=" << r.iterations
+                          << ", converged=" << r.converged << ")\n";
+                records[job.index] = std::move(r);
+            }
+        } else {
+            const std::size_t worker_count =
+                resolve_restart_worker_count(A, jobs.size());
+            std::cerr << "Running " << jobs.size()
+                      << " restarts with " << worker_count
+                      << " parallel workers\n";
+
+            std::atomic<std::size_t> next_job{0};
+            std::mutex log_mutex;
+            std::exception_ptr first_error = nullptr;
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count);
+
+            auto worker = [&]() {
+                while (true) {
+                    const std::size_t j = next_job.fetch_add(1);
+                    if (j >= jobs.size()) break;
+                    const auto& job = jobs[j];
+                    {
+                        std::lock_guard<std::mutex> lock(log_mutex);
+                        std::cerr << "  " << job.label
+                                  << " seed=" << job.seed << " ... started\n";
+                    }
+                    try {
+                        auto r = run_job(job);
+                        {
+                            std::lock_guard<std::mutex> lock(log_mutex);
+                            std::cerr << "  " << job.label
+                                      << " seed=" << job.seed
+                                      << " ... log L = " << r.log_likelihood
+                                      << " (iters=" << r.iterations
+                                      << ", converged=" << r.converged << ")\n";
+                            records[job.index] = std::move(r);
+                        }
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(log_mutex);
+                        if (!first_error) first_error = std::current_exception();
+                        next_job.store(jobs.size());
+                    }
+                }
+            };
+
+            for (std::size_t i = 0; i < worker_count; ++i)
+                workers.emplace_back(worker);
+            for (auto& t : workers) t.join();
+            if (first_error) std::rethrow_exception(first_error);
         }
 
         // Best by log_likelihood.
         best = &records[0];
-        for (const auto& r : records)
-            if (r.log_likelihood > best->log_likelihood) best = &r;
+        best_restart_index = 0;
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            if (records[i].log_likelihood > best->log_likelihood) {
+                best = &records[i];
+                best_restart_index = i;
+            }
+        }
 
         std::cerr << "\nBest: " << best->label << " seed=" << best->seed
                   << " log L = " << best->log_likelihood << "\n";
@@ -1761,7 +2579,9 @@ int main_impl(int argc, char* argv[]) {
     // ── Posterior extraction at best params (one extra E-step pass) ────────
     // In --bayes_opt mode this is the ONLY E-step pass. In the EM modes the
     // log L returned here will match best->log_likelihood up to floating drift.
-    auto post = compute_posteriors(trees, observed_data, metadata, k, d, fix_pi, *best);
+    auto post = compute_posteriors(
+        trees, observed_data, metadata, k, d, fix_pi,
+        A.diagonal_covariance, A.ctmc_weight, A.emission_weight, *best);
 
     // ── JSON output ────────────────────────────────────────────────────────
     std::cout.precision(10);
@@ -1775,14 +2595,46 @@ int main_impl(int argc, char* argv[]) {
     std::cout << "  \"n_observed\": " << n_observed << ",\n";
     std::cout << "  \"n_leaves\": " << total_leaves << ",\n";
     std::cout << "  \"n_trees\": " << n_trees << ",\n";
+    std::cout << "  \"runtime\": {\"available_cpus\": "
+              << detected_cpus
+              << ", \"restart_jobs\": " << restart_job_count_for_print
+              << ", \"restart_workers\": "
+              << restart_worker_count_for_print
+              << ", \"restart_worker_mode\": \""
+              << restart_worker_mode_for_print << "\"},\n";
+    std::cout << "  \"kmeans_init\": {\"mode\": \""
+              << (A.kmeans_standard ? "standard" : "seeding")
+              << "\", \"lloyd_max_iter\": " << A.kmeans_max_iter
+              << ", \"lloyd_tol\": " << A.kmeans_tol
+              << "},\n";
+    std::cout << "  \"covariance_mode\": \""
+              << (A.diagonal_covariance ? "diagonal" : "full") << "\",\n";
+    std::cout << "  \"objective_weights\": {\"ctmc\": "
+              << A.ctmc_weight << ", \"emission\": "
+              << A.emission_weight << "},\n";
+    std::cout << "  \"parallel_restarts\": {\"enabled\": "
+              << (A.parallel_restarts ? "true" : "false")
+              << ", \"threads\": " << A.restart_threads << "},\n";
+    std::cout << "  \"best_restart\": ";
+    if (best_restart_index) {
+        std::cout << "{\"index\": " << *best_restart_index
+                  << ", \"label\": \"" << best->label
+                  << "\", \"seed\": " << best->seed
+                  << ", \"log_likelihood\": " << best->log_likelihood
+                  << "},\n";
+    } else {
+        std::cout << "null,\n";
+    }
 
     // mode: records which mode flags were active so callers can verify the
-    // run was parameterized as intended. All fields omitted from JSON unless
-    // the corresponding flag was set.
+    // run was parameterized as intended. Objective weights are always shown;
+    // other fields are omitted unless the corresponding flag was set.
     std::cout << "  \"mode\": {";
     {
         bool first = true;
         auto sep = [&]() { if (!first) std::cout << ", "; first = false; };
+        sep(); std::cout << "\"ctmc_weight\": " << A.ctmc_weight;
+        sep(); std::cout << "\"emission_weight\": " << A.emission_weight;
         if (A.fix_q_rate) {
             sep(); std::cout << "\"fix_q_rate\": " << *A.fix_q_rate;
         }
@@ -1807,6 +2659,11 @@ int main_impl(int argc, char* argv[]) {
                 sep(); std::cout << "\"true_q_exit_rate\": "   << *A.true_q_exit_rate;
                 sep(); std::cout << "\"true_simplex_scale\": " << *A.true_simplex_scale;
             }
+        }
+        if (A.init_params_json) {
+            sep();
+            std::cout << "\"init_params_json\": \""
+                      << *A.init_params_json << "\"";
         }
         if (A.init_emission_json) {
             sep();
@@ -1918,13 +2775,42 @@ int main_impl(int argc, char* argv[]) {
     std::cout << "  \"per_restart\": [\n";
     for (std::size_t i = 0; i < records.size(); ++i) {
         const auto& r = records[i];
+        const bool is_best = best_restart_index && *best_restart_index == i;
         if (i > 0) std::cout << ",\n";
         std::cout << "    {\"label\":\"" << r.label
                   << "\",\"seed\":" << r.seed
+                  << ",\"initial_log_likelihood\":" << r.initial_log_likelihood
                   << ",\"log_likelihood\":" << r.log_likelihood
                   << ",\"iterations\":" << r.iterations
                   << ",\"converged\":" << (r.converged ? "true" : "false")
-                  << "}";
+                  << ",\"is_best\":" << (is_best ? "true" : "false");
+        std::cout << ",\"log_likelihood_trace\":";
+        dump_double_vector(std::cout, r.log_likelihood_trace);
+        std::cout << ",\"complete_data_objective_trace\":";
+        dump_complete_data_objective_trace(
+            std::cout, r.complete_data_objective_trace);
+        std::cout << ",\"initial\":{\"log_likelihood\":"
+                  << r.initial_log_likelihood
+                  << ",\"Q\":";
+        dump_matrix(std::cout, r.initial_Q);
+        std::cout << ",\"mu\":";
+        dump_vector_list(std::cout, r.initial_mu);
+        std::cout << ",\"Sigma\":";
+        dump_matrix_list(std::cout, r.initial_Sigma);
+        std::cout << ",\"pi\":";
+        dump_vec(std::cout, r.initial_pi);
+        std::cout << "}";
+        std::cout << ",\"final\":{\"log_likelihood\":"
+                  << r.log_likelihood
+                  << ",\"Q\":";
+        dump_matrix(std::cout, r.Q);
+        std::cout << ",\"mu\":";
+        dump_vector_list(std::cout, r.mu);
+        std::cout << ",\"Sigma\":";
+        dump_matrix_list(std::cout, r.Sigma);
+        std::cout << ",\"pi\":";
+        dump_vec(std::cout, r.pi);
+        std::cout << "}}";
     }
     std::cout << "\n  ]\n";
     std::cout << "}\n";
