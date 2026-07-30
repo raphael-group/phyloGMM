@@ -298,7 +298,7 @@ class phylo_gmm_problem
 public:
     bool fix_Q         = false;
     bool fix_emission  = false;
-    bool stationary_pi = true;  // disabled when CLI fix_pi=1 (pi held at 1/k)
+    bool stationary_pi = false;  // default: pi is a free EM parameter (= root posterior)
 
     std::size_t k_() const { return static_cast<std::size_t>(stm->Q.rows()); }
     std::size_t d_() const { return obs->d; }
@@ -1151,7 +1151,7 @@ struct cli_args {
     int         max_iter     = 100;
     double      tol          = 1e-5;
     double      q_init_rate  = -1.0;
-    bool        fix_pi       = false;
+    bool        fix_pi       = true;   // default pi_mode=free (fix_pi=true => stationary_pi=false)
     int         n_init       = 10;
     bool        verbose      = false;
 
@@ -1183,7 +1183,7 @@ void print_usage(const char* prog) {
       "\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
       "\n"
-      "Pi mode (default 'stationary'):\n"
+      "Pi mode (default 'free'):\n"
       "  --pi_mode stationary    pi = stationary distribution of Q, recomputed\n"
       "                          after every Q update. NOT a free EM parameter.\n"
       "  --pi_mode free          pi initialized uniformly, then freely fit each\n"
