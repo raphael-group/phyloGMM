@@ -1,12 +1,15 @@
 #include "io.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -52,13 +55,27 @@ std::vector<tree> parse_newick_trees(const std::string& fname) {
     std::ifstream file(fname);
     if (!file) throw std::runtime_error("Cannot open tree file: " + fname);
 
+    // Per-process, per-call temp path so concurrent phylocore processes can't
+    // collide on a hard-coded /tmp/phylocore_newick_<line>.nwk. Honor TMPDIR
+    // when set; otherwise fall back to /tmp. Include the PID + a process-local
+    // monotonic counter so multiple parse_newick_trees() calls within one
+    // process are also unique.
+    const char* tmpdir_env = std::getenv("TMPDIR");
+    std::string tmpdir = (tmpdir_env && *tmpdir_env) ? tmpdir_env : "/tmp";
+    if (!tmpdir.empty() && tmpdir.back() == '/') tmpdir.pop_back();
+    static std::atomic<int> call_counter{0};
+    int call_id = call_counter.fetch_add(1);
+    int pid = static_cast<int>(::getpid());
+
     std::vector<tree> trees;
     std::string line;
     int line_num = 0;
     while (std::getline(file, line)) {
         ++line_num;
         if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        std::string tmp = "/tmp/phylocore_newick_" + std::to_string(line_num) + ".nwk";
+        std::string tmp = tmpdir + "/phylocore_newick_pid" + std::to_string(pid)
+                          + "_c" + std::to_string(call_id)
+                          + "_l" + std::to_string(line_num) + ".nwk";
         { std::ofstream out(tmp); if (!out) throw std::runtime_error("Cannot create temp file: " + tmp); out << line << "\n"; }
         trees.push_back(parse_newick_tree_file(tmp));
         std::remove(tmp.c_str());
