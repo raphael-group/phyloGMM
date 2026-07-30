@@ -830,7 +830,8 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               std::optional<double>              fix_q_rate    = std::nullopt,
                               bool                               fix_emission  = false,
                               std::optional<Eigen::MatrixXd>     fix_q_matrix  = std::nullopt,
-                              const init_emission_bundle*        init_emission = nullptr) {
+                              const init_emission_bundle*        init_emission = nullptr,
+                              bool                               verbose       = false) {
     ctmc_model stm;
     gmm_observation_model obs;
     obs.d = d;
@@ -935,7 +936,7 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     phylocore::optimize::em_options opts;
     opts.rel_tol          = tol;
     opts.max_iter         = max_iter;
-    opts.verbose          = false;
+    opts.verbose          = verbose;
     opts.warn_on_decrease = false;
 
     auto results = phylocore::optimize::em(problem, opts);
@@ -1152,6 +1153,7 @@ struct cli_args {
     double      q_init_rate  = -1.0;
     bool        fix_pi       = false;
     int         n_init       = 10;
+    bool        verbose      = false;
 
     // Mode selectors. At most one of {fix_q_rate/fix_q_json, fix_labels_csv,
     // bayes_opt} may be set. --fix_emission may be combined with --fix_q
@@ -1175,9 +1177,11 @@ void print_usage(const char* prog) {
       "\n"
       "Usage (joint inference / mode selection, flag-based):\n"
       "  " << prog << " --k K [--max_iter N] [--tol T] [--q_init_rate R] \\\n"
-      "                [--pi_mode stationary|free] [--n_init N] \\\n"
+      "                [--pi_mode stationary|free] [--n_init N] [--verbose] \\\n"
       "                --tree T1 --obs O1 [--tree T2 --obs O2 ...] \\\n"
       "                [mode flag]\n"
+      "\n"
+      "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
       "\n"
       "Pi mode (default 'stationary'):\n"
       "  --pi_mode stationary    pi = stationary distribution of Q, recomputed\n"
@@ -1260,6 +1264,7 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
                 a.fix_pi = std::stoi(next()) != 0;
             }
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
+            else if (s == "--verbose")           a.verbose          = true;
             else if (s == "--fix_emission")      a.fix_emission     = true;
             else if (s == "--fix_q")             a.fix_q_rate       = std::stod(next());
             else if (s == "--fix_q_json")        a.fix_q_json       = next();
@@ -1716,7 +1721,8 @@ int main_impl(int argc, char* argv[]) {
                                     A.fix_emission
                                        || A.fix_labels_csv.has_value(),
                                     fix_q_mat,
-                                    init_ptr);
+                                    init_ptr,
+                                    A.verbose);
             std::cerr << "log L = " << r.log_likelihood
                       << " (iters=" << r.iterations
                       << ", converged=" << r.converged << ")\n";
@@ -1735,7 +1741,8 @@ int main_impl(int argc, char* argv[]) {
                                     A.fix_emission
                                        || A.fix_labels_csv.has_value(),
                                     fix_q_mat,
-                                    init_ptr);
+                                    init_ptr,
+                                    A.verbose);
             std::cerr << "log L = " << r.log_likelihood
                       << " (iters=" << r.iterations
                       << ", converged=" << r.converged << ")\n";
