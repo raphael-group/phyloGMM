@@ -497,6 +497,11 @@ public:
     bool stationary_pi = false;  // default: pi is a free EM parameter (= root posterior)
     double ctmc_weight = 1.0;
     double emission_weight = 1.0;
+    // Ridge added to every Sigma_i diagonal in the M-step. Bounds the emission
+    // covariance away from singular, so a component cannot collapse onto a
+    // point and drive the Gaussian log-density to +inf. sklearn's
+    // GaussianMixture calls this reg_covar and defaults it to the same 1e-6.
+    double reg_covar = 1e-6;
 
     double emission_log_weight() const override { return emission_weight; }
 
@@ -786,14 +791,14 @@ public:
                     for (std::size_t a = 0; a < d; ++a) {
                         if (diag[static_cast<Eigen::Index>(a)] < 0.0)
                             diag[static_cast<Eigen::Index>(a)] = 0.0;
-                        diag[static_cast<Eigen::Index>(a)] += 1e-6;
+                        diag[static_cast<Eigen::Index>(a)] += reg_covar;
                     }
                     Sigma_new[i] = diag.asDiagonal();
                 } else {
                     Eigen::MatrixXd S = ss.Sigma_outer[i] / N_i
                                       - mu_new[i] * mu_new[i].transpose();
                     S = 0.5 * (S + S.transpose());
-                    S += 1e-6 * Eigen::MatrixXd::Identity(d, d);
+                    S += reg_covar * Eigen::MatrixXd::Identity(d, d);
                     Sigma_new[i] = S;
                 }
             }
@@ -1363,7 +1368,8 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               bool                               diagonal_covariance = false,
                               std::optional<Eigen::MatrixXd>     fix_q_matrix  = std::nullopt,
                               const init_emission_bundle*        init_emission = nullptr,
-                              bool                               verbose       = false) {
+                              bool                               verbose       = false,
+                              double                             reg_covar     = 1e-6) {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
     gmm_observation_model obs;
@@ -1400,6 +1406,7 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     problem.observed_data = &observed_data;
     problem.metadata      = &metadata;
     problem.ctmc_weight   = ctmc_weight;
+    problem.reg_covar     = reg_covar;
     problem.emission_weight = emission_weight;
     for (std::size_t i = 0; i < trees.size(); ++i) {
         problem.trees.push_back(trees[i]);
@@ -1802,6 +1809,7 @@ struct cli_args {
     int         kmeans_max_iter = 100;
     double      kmeans_tol      = 1e-6;
     bool        diagonal_covariance = false;
+    double      reg_covar           = 1e-6;
     bool        parallel_restarts   = false;
     int         restart_threads     = 0;  // 0 means hardware_concurrency
 
@@ -1845,6 +1853,10 @@ void print_usage(const char* prog) {
       "Performance / covariance options:\n"
       "  --diag_covariance       fit diagonal Σ_i instead of full d×d covariance\n"
       "                          matrices. Equivalent spelling: --diagonal_covariance.\n"
+      "  --reg_covar R           ridge added to every Sigma_i diagonal each M-step\n"
+      "                          (default 1e-6). Raise it if components collapse\n"
+      "                          onto near-singleton clusters. Same role as\n"
+      "                          sklearn GaussianMixture's reg_covar.\n"
       "  --parallel_restarts [N] run independent restarts concurrently. Optional N\n"
       "                          caps worker threads; omit or use 0 for hardware count.\n"
       "  --restart_threads N     set the parallel restart worker cap and enable\n"
@@ -1966,6 +1978,13 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--diag_covariance" ||
                      s == "--diagonal_covariance") {
                 a.diagonal_covariance = true;
+            }
+            else if (s == "--reg_covar") {
+                a.reg_covar = std::stod(next());
+                if (!(a.reg_covar >= 0.0))
+                    throw std::runtime_error(
+                        "--reg_covar must be >= 0. Got: "
+                        + std::to_string(a.reg_covar));
             }
             else if (s == "--parallel_restarts") {
                 a.parallel_restarts = true;
@@ -2495,7 +2514,8 @@ int main_impl(int argc, char* argv[]) {
                                   A.diagonal_covariance,
                                   fix_q_mat,
                                   init_ptr,
-                                  A.verbose);
+                                  A.verbose,
+                                  A.reg_covar);
         };
 
         records.resize(jobs.size());
@@ -2611,6 +2631,9 @@ int main_impl(int argc, char* argv[]) {
               << "},\n";
     std::cout << "  \"covariance_mode\": \""
               << (A.diagonal_covariance ? "diagonal" : "full") << "\",\n";
+    std::cout << "  \"reg_covar\": ";
+    dump_json_number(std::cout, A.reg_covar);
+    std::cout << ",\n";
     std::cout << "  \"objective_weights\": {\"ctmc\": "
               << A.ctmc_weight << ", \"emission\": "
               << A.emission_weight << "},\n";
