@@ -1551,7 +1551,7 @@ void dump_matrix(std::ostream& os, const Eigen::MatrixXd& M) {
         os << "[";
         for (Eigen::Index j = 0; j < M.cols(); ++j) {
             if (j > 0) os << ", ";
-            os << M(i, j);
+            dump_json_number(os, M(i, j));
         }
         os << "]";
     }
@@ -1562,7 +1562,7 @@ void dump_vec(std::ostream& os, const Eigen::VectorXd& v) {
     os << "[";
     for (Eigen::Index i = 0; i < v.size(); ++i) {
         if (i > 0) os << ", ";
-        os << v[i];
+        dump_json_number(os, v[i]);
     }
     os << "]";
 }
@@ -1571,7 +1571,7 @@ void dump_double_vector(std::ostream& os, const std::vector<double>& values) {
     os << "[";
     for (std::size_t i = 0; i < values.size(); ++i) {
         if (i > 0) os << ", ";
-        os << values[i];
+        dump_json_number(os, values[i]);
     }
     os << "]";
 }
@@ -2589,7 +2589,9 @@ int main_impl(int argc, char* argv[]) {
     // log_likelihood: prefer the post-pass value so --bayes_opt mode reports
     // a real number (best->log_likelihood is 0 there). In EM modes this is
     // numerically equivalent to best->log_likelihood up to one E-step's drift.
-    std::cout << "  \"log_likelihood\": " << post.log_likelihood << ",\n";
+    std::cout << "  \"log_likelihood\": ";
+    dump_json_number(std::cout, post.log_likelihood);
+    std::cout << ",\n";
     std::cout << "  \"k\": " << k << ",\n";
     std::cout << "  \"d\": " << d << ",\n";
     std::cout << "  \"n_observed\": " << n_observed << ",\n";
@@ -2620,8 +2622,9 @@ int main_impl(int argc, char* argv[]) {
         std::cout << "{\"index\": " << *best_restart_index
                   << ", \"label\": \"" << best->label
                   << "\", \"seed\": " << best->seed
-                  << ", \"log_likelihood\": " << best->log_likelihood
-                  << "},\n";
+                  << ", \"log_likelihood\": ";
+        dump_json_number(std::cout, best->log_likelihood);
+        std::cout << "},\n";
     } else {
         std::cout << "null,\n";
     }
@@ -2779,9 +2782,11 @@ int main_impl(int argc, char* argv[]) {
         if (i > 0) std::cout << ",\n";
         std::cout << "    {\"label\":\"" << r.label
                   << "\",\"seed\":" << r.seed
-                  << ",\"initial_log_likelihood\":" << r.initial_log_likelihood
-                  << ",\"log_likelihood\":" << r.log_likelihood
-                  << ",\"iterations\":" << r.iterations
+                  << ",\"initial_log_likelihood\":";
+        dump_json_number(std::cout, r.initial_log_likelihood);
+        std::cout << ",\"log_likelihood\":";
+        dump_json_number(std::cout, r.log_likelihood);
+        std::cout << ",\"iterations\":" << r.iterations
                   << ",\"converged\":" << (r.converged ? "true" : "false")
                   << ",\"is_best\":" << (is_best ? "true" : "false");
         std::cout << ",\"log_likelihood_trace\":";
@@ -2789,9 +2794,9 @@ int main_impl(int argc, char* argv[]) {
         std::cout << ",\"complete_data_objective_trace\":";
         dump_complete_data_objective_trace(
             std::cout, r.complete_data_objective_trace);
-        std::cout << ",\"initial\":{\"log_likelihood\":"
-                  << r.initial_log_likelihood
-                  << ",\"Q\":";
+        std::cout << ",\"initial\":{\"log_likelihood\":";
+        dump_json_number(std::cout, r.initial_log_likelihood);
+        std::cout << ",\"Q\":";
         dump_matrix(std::cout, r.initial_Q);
         std::cout << ",\"mu\":";
         dump_vector_list(std::cout, r.initial_mu);
@@ -2800,9 +2805,9 @@ int main_impl(int argc, char* argv[]) {
         std::cout << ",\"pi\":";
         dump_vec(std::cout, r.initial_pi);
         std::cout << "}";
-        std::cout << ",\"final\":{\"log_likelihood\":"
-                  << r.log_likelihood
-                  << ",\"Q\":";
+        std::cout << ",\"final\":{\"log_likelihood\":";
+        dump_json_number(std::cout, r.log_likelihood);
+        std::cout << ",\"Q\":";
         dump_matrix(std::cout, r.Q);
         std::cout << ",\"mu\":";
         dump_vector_list(std::cout, r.mu);
