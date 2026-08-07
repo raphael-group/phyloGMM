@@ -502,6 +502,13 @@ public:
     // point and drive the Gaussian log-density to +inf. sklearn's
     // GaussianMixture calls this reg_covar and defaults it to the same 1e-6.
     double reg_covar = 1e-6;
+    // Lower bound applied to every off-diagonal of Q after the M-step. 0 means
+    // disabled (the historical behaviour). complete_ctmc_objective returns -inf
+    // when it meets q_ij == 0 while E[N_ij] is still above tolerance; that is
+    // reachable because the M-step SKIPS rows with T_i < 1e-12, leaving stale
+    // zeros in Q while the objective still evaluates them. A positive floor
+    // makes that guard unreachable.
+    double q_floor = 0.0;
 
     double emission_log_weight() const override { return emission_weight; }
 
@@ -819,6 +826,25 @@ public:
 	                    row_off += v;
 	                }
                 Q_new(i, i) = -row_off;
+            }
+            if (q_floor > 0.0) {
+                // Applied to every row, including those skipped above for
+                // T_i < 1e-12 -- those are exactly the rows that retain stale
+                // zeros and trip the -inf guard in complete_ctmc_objective.
+                for (std::size_t i = 0; i < k; ++i) {
+                    double row_off = 0.0;
+                    for (std::size_t j = 0; j < k; ++j) {
+                        if (i == j) continue;
+                        const double v = std::max(
+                            Q_new(static_cast<Eigen::Index>(i),
+                                  static_cast<Eigen::Index>(j)), q_floor);
+                        Q_new(static_cast<Eigen::Index>(i),
+                              static_cast<Eigen::Index>(j)) = v;
+                        row_off += v;
+                    }
+                    Q_new(static_cast<Eigen::Index>(i),
+                          static_cast<Eigen::Index>(i)) = -row_off;
+                }
             }
         }
 
@@ -1369,7 +1395,8 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               std::optional<Eigen::MatrixXd>     fix_q_matrix  = std::nullopt,
                               const init_emission_bundle*        init_emission = nullptr,
                               bool                               verbose       = false,
-                              double                             reg_covar     = 1e-6) {
+                              double                             reg_covar     = 1e-6,
+                              double                             q_floor       = 0.0) {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
     gmm_observation_model obs;
@@ -1407,6 +1434,7 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     problem.metadata      = &metadata;
     problem.ctmc_weight   = ctmc_weight;
     problem.reg_covar     = reg_covar;
+    problem.q_floor       = q_floor;
     problem.emission_weight = emission_weight;
     for (std::size_t i = 0; i < trees.size(); ++i) {
         problem.trees.push_back(trees[i]);
@@ -1810,6 +1838,13 @@ struct cli_args {
     double      kmeans_tol      = 1e-6;
     bool        diagonal_covariance = false;
     double      reg_covar           = 1e-6;
+    double      q_floor             = 0.0;
+    // --warn_degenerate <weight_frac> <dwell_frac> <cov_min>: post-fit warnings
+    // on the best solution. Off unless the flag is given.
+    bool        warn_degenerate     = false;
+    double      warn_min_weight     = 0.01;   // component occupancy fraction
+    double      warn_min_dwell      = 0.005;  // component dwell fraction
+    double      warn_min_cov        = 1e-5;   // min eigenvalue of Sigma_i
     bool        parallel_restarts   = false;
     int         restart_threads     = 0;  // 0 means hardware_concurrency
 
@@ -1853,10 +1888,19 @@ void print_usage(const char* prog) {
       "Performance / covariance options:\n"
       "  --diag_covariance       fit diagonal Σ_i instead of full d×d covariance\n"
       "                          matrices. Equivalent spelling: --diagonal_covariance.\n"
+      "  --q_floor R             lower bound on every off-diagonal of Q after the\n"
+      "                          M-step (default 0 = off). Prevents q_ij from\n"
+      "                          reaching exactly 0, which makes the CTMC term of\n"
+      "                          the complete-data objective -inf. Set well below\n"
+      "                          any rate you expect to estimate.\n"
       "  --reg_covar R           ridge added to every Sigma_i diagonal each M-step\n"
       "                          (default 1e-6). Raise it if components collapse\n"
       "                          onto near-singleton clusters. Same role as\n"
       "                          sklearn GaussianMixture's reg_covar.\n"
+      "  --warn_degenerate W D C  post-fit warnings on the best solution: flag any\n"
+      "                          component with occupancy fraction < W, dwell\n"
+      "                          fraction < D, or min-eigenvalue(Sigma_i) < C.\n"
+      "                          e.g. --warn_degenerate 0.01 0.005 1e-5\n"
       "  --parallel_restarts [N] run independent restarts concurrently. Optional N\n"
       "                          caps worker threads; omit or use 0 for hardware count.\n"
       "  --restart_threads N     set the parallel restart worker cap and enable\n"
@@ -1985,6 +2029,19 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
                     throw std::runtime_error(
                         "--reg_covar must be >= 0. Got: "
                         + std::to_string(a.reg_covar));
+            }
+            else if (s == "--q_floor") {
+                a.q_floor = std::stod(next());
+                if (!(a.q_floor >= 0.0))
+                    throw std::runtime_error(
+                        "--q_floor must be >= 0. Got: "
+                        + std::to_string(a.q_floor));
+            }
+            else if (s == "--warn_degenerate") {
+                a.warn_degenerate = true;
+                a.warn_min_weight = std::stod(next());
+                a.warn_min_dwell  = std::stod(next());
+                a.warn_min_cov    = std::stod(next());
             }
             else if (s == "--parallel_restarts") {
                 a.parallel_restarts = true;
@@ -2515,7 +2572,8 @@ int main_impl(int argc, char* argv[]) {
                                   fix_q_mat,
                                   init_ptr,
                                   A.verbose,
-                                  A.reg_covar);
+                                  A.reg_covar,
+                                  A.q_floor);
         };
 
         records.resize(jobs.size());
@@ -2603,6 +2661,51 @@ int main_impl(int argc, char* argv[]) {
         trees, observed_data, metadata, k, d, fix_pi,
         A.diagonal_covariance, A.ctmc_weight, A.emission_weight, *best);
 
+    // ── Degenerate-component warnings on the best solution ──────────────────
+    // Flags components that look collapsed: low occupancy (few cells assigned),
+    // low dwell time, or a near-singular covariance. Detection only; does not
+    // change the fit. Populated only when --warn_degenerate is given.
+    std::vector<std::string> degenerate_warnings;
+    if (A.warn_degenerate) {
+        std::vector<std::size_t> occ(k, 0);
+        for (int lbl : post.leaf_labels)
+            if (lbl >= 0 && static_cast<std::size_t>(lbl) < k) occ[lbl]++;
+        const double dwell_total = post.expected_dwell_times.sum();
+        for (std::size_t i = 0; i < k; ++i) {
+            const double w = total_leaves
+                ? static_cast<double>(occ[i]) / static_cast<double>(total_leaves) : 0.0;
+            if (A.warn_min_weight > 0.0 && w < A.warn_min_weight)
+                degenerate_warnings.push_back(
+                    "component " + std::to_string(i) + " low occupancy: "
+                    + std::to_string(occ[i]) + " cells ("
+                    + std::to_string(100.0 * w) + "% < "
+                    + std::to_string(100.0 * A.warn_min_weight) + "%)");
+            const double dfrac = (dwell_total > 0.0)
+                ? post.expected_dwell_times[static_cast<Eigen::Index>(i)] / dwell_total : 0.0;
+            if (A.warn_min_dwell > 0.0 && dfrac < A.warn_min_dwell)
+                degenerate_warnings.push_back(
+                    "component " + std::to_string(i) + " low dwell: fraction "
+                    + std::to_string(dfrac) + " < " + std::to_string(A.warn_min_dwell));
+            double min_eig;
+            if (A.diagonal_covariance) {
+                min_eig = best->Sigma[i].diagonal().minCoeff();
+            } else {
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(
+                    best->Sigma[i], Eigen::EigenvaluesOnly);
+                min_eig = es.eigenvalues().minCoeff();
+            }
+            if (A.warn_min_cov > 0.0 && min_eig < A.warn_min_cov)
+                degenerate_warnings.push_back(
+                    "component " + std::to_string(i)
+                    + " near-collapsed covariance: min eigenvalue "
+                    + std::to_string(min_eig) + " < " + std::to_string(A.warn_min_cov));
+        }
+        for (const auto& w : degenerate_warnings)
+            std::cerr << "WARNING: " << w << "\n";
+        if (degenerate_warnings.empty())
+            std::cerr << "[warn_degenerate] no degenerate components detected.\n";
+    }
+
     // ── JSON output ────────────────────────────────────────────────────────
     std::cout.precision(10);
     std::cout << "{\n";
@@ -2612,6 +2715,12 @@ int main_impl(int argc, char* argv[]) {
     std::cout << "  \"log_likelihood\": ";
     dump_json_number(std::cout, post.log_likelihood);
     std::cout << ",\n";
+    std::cout << "  \"warnings\": [";
+    for (std::size_t i = 0; i < degenerate_warnings.size(); ++i) {
+        if (i) std::cout << ", ";
+        std::cout << "\"" << degenerate_warnings[i] << "\"";
+    }
+    std::cout << "],\n";
     std::cout << "  \"k\": " << k << ",\n";
     std::cout << "  \"d\": " << d << ",\n";
     std::cout << "  \"n_observed\": " << n_observed << ",\n";
@@ -2633,6 +2742,9 @@ int main_impl(int argc, char* argv[]) {
               << (A.diagonal_covariance ? "diagonal" : "full") << "\",\n";
     std::cout << "  \"reg_covar\": ";
     dump_json_number(std::cout, A.reg_covar);
+    std::cout << ",\n";
+    std::cout << "  \"q_floor\": ";
+    dump_json_number(std::cout, A.q_floor);
     std::cout << ",\n";
     std::cout << "  \"objective_weights\": {\"ctmc\": "
               << A.ctmc_weight << ", \"emission\": "
