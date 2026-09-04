@@ -85,6 +85,7 @@
 #include "optimize/em.h"
 #include "optimize/estimation_results.h"
 #include "optimize/hobolth_jensen.h"
+#include "optimize/van_loan.h"
 #include "optimize/joint_optimization_problem.h"
 #include "phylogeny.h"
 #include "state_transition_models/ctmc.h"
@@ -485,6 +486,12 @@ constexpr double expected_transition_tol = 1e-10;
 // The positive scalar weights cancel from each block's closed-form M-step,
 // but they change its sufficient statistics through the weighted E-step.
 
+// Set once from --van_loan in main_impl (before any restart threads spawn) and
+// only read thereafter, so it is safe to share across parallel restarts. When
+// true, compute_suff_stats() uses the expm-based Van Loan path instead of the
+// eigendecomposition-based Hobolth-Jensen path.
+bool g_use_van_loan = false;
+
 class phylo_gmm_problem
     : public phylocore::optimize::joint_optimization_problem<
           phylocore::ctmc_model,
@@ -768,7 +775,9 @@ public:
                     ss.root_gamma_total[i] += std::exp(log_gamma[i]);
             }
         }
-        auto hj = phylocore::optimize::hobolth_jensen_stats(*this);
+        auto hj = g_use_van_loan
+                      ? phylocore::optimize::van_loan_stats(*this)
+                      : phylocore::optimize::hobolth_jensen_stats(*this);
         ss.N_total = hj.N_total;
         ss.T_total = hj.T_total;
         return ss;
@@ -1805,7 +1814,9 @@ posterior_outputs compute_posteriors(
         }
     }
 
-    auto hj = phylocore::optimize::hobolth_jensen_stats(prob);
+    auto hj = g_use_van_loan
+                  ? phylocore::optimize::van_loan_stats(prob)
+                  : phylocore::optimize::hobolth_jensen_stats(prob);
     out.expected_transitions = hj.N_total;
     out.expected_dwell_times = hj.T_total;
     out.log_likelihood       = final_log_likelihood;
@@ -1831,6 +1842,7 @@ struct cli_args {
     bool        fix_pi       = true;   // default pi_mode=free (fix_pi=true => stationary_pi=false)
     int         n_init       = 10;
     bool        verbose      = false;
+    bool        van_loan     = false;  // --van_loan: expm suff-stats instead of Hobolth-Jensen
     double      ctmc_weight  = 1.0;
     double      emission_weight = 1.0;
     bool        kmeans_standard = false;
@@ -1908,6 +1920,10 @@ void print_usage(const char* prog) {
       "\n"
       "Diagnostics:\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
+      "  --van_loan              Compute CTMC E-step sufficient statistics via the\n"
+      "                          Van Loan block-expm identity instead of the default\n"
+      "                          Hobolth-Jensen eigendecomposition. Slower but robust\n"
+      "                          on defective / near-absorbing Q (no U^-1 blow-up).\n"
       "\n"
       "Pi mode (default 'free'):\n"
       "  --pi_mode stationary    pi = stationary distribution of Q, recomputed\n"
@@ -2009,6 +2025,7 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             }
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
             else if (s == "--verbose")           a.verbose          = true;
+            else if (s == "--van_loan")          a.van_loan         = true;
             else if (s == "--kmeans_init") {
                 std::string m = next();
                 if      (m == "seeding")  a.kmeans_standard = false;
@@ -2225,6 +2242,8 @@ int main_impl(int argc, char* argv[]) {
         print_usage(argv[0]);
         return 1;
     }
+
+    g_use_van_loan = A.van_loan;
 
     const std::size_t k           = A.k;
     const int         max_iter    = A.max_iter;
