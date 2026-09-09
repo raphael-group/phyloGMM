@@ -492,6 +492,12 @@ constexpr double expected_transition_tol = 1e-10;
 // eigendecomposition-based Hobolth-Jensen path.
 bool g_use_van_loan = false;
 
+// Set once from --pade_expm in main_impl (before any restart threads spawn).
+// When true, ctmc_model computes exp(t*Q) by scaling-and-squaring instead of
+// from its cached eigendecomposition. See ctmc.h for why this matters on a
+// reducible Q.
+bool g_use_pade_expm = false;
+
 class phylo_gmm_problem
     : public phylocore::optimize::joint_optimization_problem<
           phylocore::ctmc_model,
@@ -1408,6 +1414,7 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               double                             q_floor       = 0.0) {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
+    stm.use_pade_expm        = g_use_pade_expm;
     gmm_observation_model obs;
     obs.d = d;
     obs.diagonal_covariance = diagonal_covariance;
@@ -1708,6 +1715,7 @@ posterior_outputs compute_posteriors(
 {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
+    stm.use_pade_expm        = g_use_pade_expm;
     stm.Q = best.Q;
     // Pre-install π as root_prior so ctmc_model::build() doesn't overwrite it
     // with uniform (its empty-or-wrong-size fallback).
@@ -1843,6 +1851,7 @@ struct cli_args {
     int         n_init       = 10;
     bool        verbose      = false;
     bool        van_loan     = false;  // --van_loan: expm suff-stats instead of Hobolth-Jensen
+    bool        pade_expm    = false;  // --pade_expm: scaling-and-squaring exp(tQ) in the likelihood
     double      ctmc_weight  = 1.0;
     double      emission_weight = 1.0;
     bool        kmeans_standard = false;
@@ -1920,6 +1929,12 @@ void print_usage(const char* prog) {
       "\n"
       "Diagnostics:\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
+      "  --pade_expm             Compute exp(t*Q) for branch transition probabilities\n"
+      "                          by scaling-and-squaring (Pade) instead of from the\n"
+      "                          cached eigendecomposition. Slower, but the only\n"
+      "                          correct choice when Q is reducible: the eigen route\n"
+      "                          rebuilds structural zeros by cancellation, making the\n"
+      "                          likelihood depend on how states are numbered.\n"
       "  --van_loan              Compute CTMC E-step sufficient statistics via the\n"
       "                          Van Loan block-expm identity instead of the default\n"
       "                          Hobolth-Jensen eigendecomposition. Slower but robust\n"
@@ -2026,6 +2041,7 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
             else if (s == "--verbose")           a.verbose          = true;
             else if (s == "--van_loan")          a.van_loan         = true;
+            else if (s == "--pade_expm")         a.pade_expm        = true;
             else if (s == "--kmeans_init") {
                 std::string m = next();
                 if      (m == "seeding")  a.kmeans_standard = false;
@@ -2243,7 +2259,8 @@ int main_impl(int argc, char* argv[]) {
         return 1;
     }
 
-    g_use_van_loan = A.van_loan;
+    g_use_van_loan   = A.van_loan;
+    g_use_pade_expm  = A.pade_expm;
 
     const std::size_t k           = A.k;
     const int         max_iter    = A.max_iter;

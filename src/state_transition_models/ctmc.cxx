@@ -1,5 +1,7 @@
 #include "state_transition_models/ctmc.h"
 
+#include <unsupported/Eigen/MatrixFunctions>
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -62,6 +64,7 @@ void ctmc_model::build() {
     // branch kernel exp(tA), A_ii=w_C Q_ii, A_ij=Q_ij^w_C.
     if (complete_data_weight == 1.0) {
         cache = rate_cache;
+        branch_operator = Q;
     } else {
         Eigen::MatrixXd A(Q.rows(), Q.cols());
         for (size_t i = 0; i < k; ++i) {
@@ -92,6 +95,7 @@ void ctmc_model::build() {
         cache.U      = weighted_solver.eigenvectors();
         cache.lambda = weighted_solver.eigenvalues();
         cache.U_inv  = cache.U.inverse();
+        branch_operator = A;
     }
 
     // Single shared site_space — the paper assumes one Q across the tree.
@@ -116,6 +120,18 @@ void ctmc_model::build() {
     has_optimized_functions = true;
 }
 
+// ── Pade branch operator ──────────────────────────────────────────────────────
+//
+// exp(t * branch_operator) by scaling-and-squaring. Unlike the eigendecomposition
+// route this never forms a dense U / U^-1, so entries of exp(tQ) that are
+// structurally zero (state j unreachable from i) come out as exactly 0.0 rather
+// than +/-1e-15. That keeps the log-space guard below deterministic and makes
+// the likelihood invariant to how the states happen to be numbered.
+
+Eigen::MatrixXd ctmc_model::pade_transition(double t) const {
+    return (branch_operator * t).exp();
+}
+
 // ── Scalar primitive ──────────────────────────────────────────────────────────
 //
 // Equation 22: P_αβ(t) = Σ_p U[α, p] · exp(λ_p · t) · U⁻¹[p, β].
@@ -131,6 +147,13 @@ double ctmc_model::compute_log_transition_probability(
     size_t alpha,
     size_t beta
 ) const {
+    if (use_pade_expm) {
+        const double prob_p =
+            pade_transition(branch_length)(static_cast<Eigen::Index>(alpha),
+                                           static_cast<Eigen::Index>(beta));
+        return (prob_p > 0.0) ? std::log(prob_p) : NEGATIVE_INFINITY;
+    }
+
     const Eigen::Index k = cache.lambda.size();
     std::complex<double> sum(0.0, 0.0);
     for (Eigen::Index p = 0; p < k; ++p) {
@@ -166,6 +189,19 @@ void ctmc_model::compute_log_pmatrix_vector_product(
 
     double max_log = *std::max_element(log_vector.begin(),
                                        log_vector.begin() + k);
+
+    if (use_pade_expm) {
+        Eigen::VectorXd vr(k);
+        for (Eigen::Index i = 0; i < k; ++i)
+            vr[i] = std::exp(log_vector[i] - max_log);
+        const Eigen::MatrixXd P = pade_transition(branch_length);
+        Eigen::VectorXd rp = transpose ? (P.transpose() * vr).eval()
+                                       : (P * vr).eval();
+        for (Eigen::Index i = 0; i < k; ++i)
+            result[i] = (rp[i] > 0.0) ? std::log(rp[i]) + max_log
+                                      : NEGATIVE_INFINITY;
+        return;
+    }
 
     Eigen::VectorXcd v(k);
     for (Eigen::Index i = 0; i < k; ++i)

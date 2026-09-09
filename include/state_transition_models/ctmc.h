@@ -22,6 +22,14 @@ namespace phylocore {
  * Q is not assumed reversible, so eigenvalues/vectors are generally complex;
  * the real part of the sum is taken and log'd.
  *
+ * Numerical note: the eigendecomposition route rebuilds structural zeros of
+ * exp(tQ) by cancellation between dense U and U^-1. For a reducible Q (many
+ * off-diagonals exactly zero) those zeros come back as +/-1e-15, and the
+ * log-space guard then maps them inconsistently to log(tiny) vs -inf depending
+ * on state ordering; when U is additionally ill-conditioned the whole matrix is
+ * unreliable. Set use_pade_expm = true to compute exp(tQ) by scaling-and-
+ * squaring (Pade) instead, which preserves the zero pattern exactly.
+ *
  * Uses the default D = std::monostate (no per-node state).
  *
  * Usage:
@@ -53,6 +61,12 @@ public:
     // A_ii = w Q_ii and A_ij = Q_ij^w (i != j). This is the exact marginal
     // kernel obtained by integrating [p_Q(path)]^w over branch paths.
     double complete_data_weight = 1.0;
+
+    // When true, exp(t * A) is computed by scaling-and-squaring (Pade) rather
+    // than from the cached eigendecomposition. Slower but numerically robust
+    // for reducible / ill-conditioned generators. The eigendecomposition is
+    // still built either way: hobolth_jensen_stats() consumes it.
+    bool use_pade_expm = false;
 
     void build();
 
@@ -111,6 +125,13 @@ private:
     };
     eigen_cache cache;       // active branch operator used by traversal
     eigen_cache rate_cache;  // unweighted generator Q
+
+    // Real branch operator matching `cache` (Q when complete_data_weight == 1,
+    // else the weighted path operator A). Used only by the Pade path.
+    Eigen::MatrixXd branch_operator;
+
+    // exp(t * branch_operator) via Eigen's scaling-and-squaring.
+    Eigen::MatrixXd pade_transition(double t) const;
 };
 
 } // namespace phylocore
