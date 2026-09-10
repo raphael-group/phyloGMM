@@ -1,12 +1,13 @@
-// run_phylo_gmm: phyloGMM driver. One binary, four modes.
+// run_phylo_gmm: phyloGMM driver with EM freeze options and Bayes mode.
 //
-// Modes (mutually exclusive; default is full EM):
+// Main modes and compatible freeze modifiers (default is full EM):
 //
 //   default          full joint EM over Q, μ, Σ, π
-//   --fix_q <rate>   EM on (μ, Σ, π) only; Q is uniform-exit-rate Q,
+//   --fix_q <rate>   EM on (μ, Σ, free π) only; Q is uniform-exit-rate Q,
 //                    Q[i,j] = rate/(k-1), Q[i,i] = -rate
-//   --fix_emission   EM on Q only; μ, Σ, π stay at the kmeans++ init values
-//   --fix_labels <csv>  EM on Q only; leaf state assignments clamped to the
+//   --fix_emission   EM on Q and free π; μ and Σ stay at their init values
+//   --fix_covariance EM on Q, μ, and free π; Σ stays at its init value
+//   --fix_labels <csv>  EM on Q and free π; leaf state assignments clamped to the
 //                       CSV. Implies --fix_emission (μ, Σ also frozen).
 //                       Labels CSV: "cell,state" header; state is 0-indexed.
 //   --bayes_opt      No EM. True (Q, μ, Σ, π) are constructed from
@@ -30,13 +31,16 @@
 //                 [--kmeans_init seeding|standard] \
 //                 [--init_params_json params.json] \
 //                 --tree T1 --obs O1 [--tree T2 --obs O2 ...]            \
-//                 [--fix_q <rate> | --fix_emission | --fix_labels <csv>  \
+//                 [--fix_covariance] [--fix_emission]                    \
+//                 [--fix_q <rate> | --fix_labels <csv>                  \
 //                  | --bayes_opt --true_q_exit_rate <r>                  \
 //                                --true_simplex_scale <s>]
 //
 // Conventions:
 //   * obs CSV: first column = taxon/cell name, remaining columns = y_0..y_{d-1}
 //   * tree:    single Newick per first non-empty line of <tree_file>
+//              pi is defined at the topological root, so any Newick branch
+//              length suffix on that root is ignored (there is no root stem)
 //   * default EM: 2 * n_init restarts total: n_init k-means++ (seeds 42..)
 //     plus n_init random (seeds 1000..). --kmeans_init standard adds Lloyd
 //     refinement after k-means++ seeding. Deterministic seeds keep per-restart
@@ -51,6 +55,7 @@
 //     "per_restart[].log_likelihood_trace",
 //     "per_restart[].complete_data_objective_trace",
 //     "mode": { "fix_q_rate": <r>?, "fix_emission": <b>?,
+//               "fix_covariance": <b>?,
 //               "ctmc_weight": <w_C>, "emission_weight": <w_E>,
 //               "fix_labels_csv": "<path>"?, "bayes_opt": <b>?,
 //               "true_q_exit_rate": <r>?, "true_simplex_scale": <s>?,
@@ -134,6 +139,10 @@ static constexpr double SIMPLEX_4[4][3] = {
 // Schema accepted (extra keys ignored):
 //   { "Q": [[K x K]], "mu": [[K x d]],
 //     "Sigma": [[[d x d], ... K]], "sigma_diag": [[K x d]], "pi": [K] }
+// --init_params_json accepts any non-empty subset of those parameter fields;
+// missing fields retain their normal per-restart initialization. Other JSON
+// modes (--fix_q_json and --bayes_opt_truth_json) still require the fields
+// documented for those modes.
 // "Sigma" is preferred for full covariance initialization; "sigma_diag" is a
 // compact diagonal-covariance spelling and remains compatible with older
 // --init_emission_json files.
@@ -143,7 +152,15 @@ struct truth_json {
     std::vector<std::vector<std::vector<double>>> Sigma;      // K × d × d
     std::vector<std::vector<double>>              sigma_diag; // K × d
     std::vector<double>                           pi;         // K (optional)
+    bool                                          has_Q = false;
+    bool                                          has_mu = false;
+    bool                                          has_Sigma = false;
+    bool                                          has_sigma_diag = false;
     bool                                          has_pi = false;
+
+    bool has_any_parameter() const {
+        return has_Q || has_mu || has_Sigma || has_sigma_diag || has_pi;
+    }
 };
 
 static truth_json load_truth_json(const std::string& path) {
@@ -273,12 +290,16 @@ static truth_json load_truth_json(const std::string& path) {
         expect(':');
         if (key == "Q") {
             out.Q = parse_num_2d();
+            out.has_Q = true;
         } else if (key == "mu") {
             out.mu = parse_num_2d();
+            out.has_mu = true;
         } else if (key == "Sigma" || key == "sigma") {
             out.Sigma = parse_num_3d();
+            out.has_Sigma = true;
         } else if (key == "sigma_diag") {
             out.sigma_diag = parse_num_2d();
+            out.has_sigma_diag = true;
         } else if (key == "pi") {
             out.pi = parse_num_array();
             out.has_pi = true;
@@ -336,7 +357,7 @@ sigma_from_json(const truth_json& tj,
                 const char*       context) {
     std::vector<Eigen::MatrixXd> out(k, Eigen::MatrixXd::Zero(d, d));
 
-    if (!tj.Sigma.empty()) {
+    if (tj.has_Sigma) {
         if (tj.Sigma.size() != k)
             throw std::runtime_error(
                 std::string(context) + ": Sigma expected " +
@@ -382,7 +403,7 @@ sigma_from_json(const truth_json& tj,
         return out;
     }
 
-    if (tj.sigma_diag.empty())
+    if (!tj.has_sigma_diag)
         throw std::runtime_error(
             std::string(context) +
             ": required key 'Sigma' or 'sigma_diag' missing or empty");
@@ -492,12 +513,6 @@ constexpr double expected_transition_tol = 1e-10;
 // eigendecomposition-based Hobolth-Jensen path.
 bool g_use_van_loan = false;
 
-// Set once from --pade_expm in main_impl (before any restart threads spawn).
-// When true, ctmc_model computes exp(t*Q) by scaling-and-squaring instead of
-// from its cached eigendecomposition. See ctmc.h for why this matters on a
-// reducible Q.
-bool g_use_pade_expm = false;
-
 class phylo_gmm_problem
     : public phylocore::optimize::joint_optimization_problem<
           phylocore::ctmc_model,
@@ -505,9 +520,10 @@ class phylo_gmm_problem
           Eigen::VectorXd,
           std::monostate> {
 public:
-    bool fix_Q         = false;
-    bool fix_emission  = false;
-    bool stationary_pi = false;  // default: pi is a free EM parameter (= root posterior)
+    bool fix_Q          = false;
+    bool fix_emission   = false;
+    bool fix_covariance = false;
+    bool stationary_pi  = false;  // default: pi is a free EM parameter (= root posterior)
     double ctmc_weight = 1.0;
     double emission_weight = 1.0;
     // Ridge added to every Sigma_i diagonal in the M-step. Bounds the emission
@@ -610,6 +626,8 @@ public:
         if (!fix_emission) {
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t a = 0; a < d; ++a) p.push_back(obs->mu[i][a]);
+        }
+        if (!fix_emission && !fix_covariance) {
             if (obs->diagonal_covariance) {
                 for (std::size_t i = 0; i < k; ++i)
                     for (std::size_t a = 0; a < d; ++a)
@@ -636,6 +654,8 @@ public:
         if (!fix_Q)         expected += k * (k - 1);
         if (!fix_emission) {
             expected += k * d;
+        }
+        if (!fix_emission && !fix_covariance) {
             expected += obs->diagonal_covariance ? k * d : k * d * d;
         }
         if (!stationary_pi) expected += (k - 1);
@@ -671,9 +691,12 @@ public:
         if (!fix_emission) {
             obs->d = d;
             obs->mu.assign(k, Eigen::VectorXd::Zero(d));
-            obs->Sigma.assign(k, Eigen::MatrixXd::Zero(d, d));
             for (std::size_t i = 0; i < k; ++i)
                 for (std::size_t a = 0; a < d; ++a) obs->mu[i][a] = params[idx++];
+        }
+
+        if (!fix_emission && !fix_covariance) {
+            obs->Sigma.assign(k, Eigen::MatrixXd::Zero(d, d));
             for (std::size_t i = 0; i < k; ++i) {
                 if (obs->diagonal_covariance) {
                     for (std::size_t a = 0; a < d; ++a) {
@@ -802,7 +825,7 @@ public:
             }
         }
         std::vector<Eigen::MatrixXd> Sigma_new = obs->Sigma;
-        if (!fix_emission) {
+        if (!fix_emission && !fix_covariance) {
             for (std::size_t i = 0; i < k; ++i) {
                 const double N_i = ss.responsibility_total[i];
                 if (N_i < 1e-12) continue;
@@ -863,10 +886,9 @@ public:
             }
         }
 
-        if (!fix_emission) {
-            obs->mu    = std::move(mu_new);
+        if (!fix_emission) obs->mu = std::move(mu_new);
+        if (!fix_emission && !fix_covariance)
             obs->Sigma = std::move(Sigma_new);
-        }
         if (!fix_Q) stm->Q = Q_new;
 
         // Non-stationary pi is derived from root_gamma_total here, BEFORE the
@@ -1368,14 +1390,12 @@ struct restart_record {
     Eigen::VectorXd              pi;
 };
 
-// Bundle of parameters loaded from --init_params_json / --init_emission_json.
-// mu and Sigma are required; Q and pi are optional (when std::nullopt the
-// caller falls back to the binary's normal init for that field). When present,
-// this struct replaces the kmeans++/random init of (μ, Σ) and optionally
-// (Q, π) for that restart.
-struct init_emission_bundle {
-    std::vector<Eigen::VectorXd>  mu;     // K vectors of length d
-    std::vector<Eigen::MatrixXd>  Sigma;  // K d×d covariance matrices
+// Optional parameter overlay loaded from --init_params_json (or its legacy
+// --init_emission_json alias). Each present field replaces the corresponding
+// normal per-restart initialization; absent fields are left unchanged.
+struct init_params_bundle {
+    std::optional<std::vector<Eigen::VectorXd>> mu;    // K vectors of length d
+    std::optional<std::vector<Eigen::MatrixXd>> Sigma; // K d×d covariance matrices
     std::optional<Eigen::MatrixXd> Q;     // K×K (optional)
     std::optional<Eigen::VectorXd> pi;    // K (optional)
 };
@@ -1406,15 +1426,15 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                               double                             emission_weight,
                               std::optional<double>              fix_q_rate    = std::nullopt,
                               bool                               fix_emission  = false,
+                              bool                               fix_covariance = false,
                               bool                               diagonal_covariance = false,
                               std::optional<Eigen::MatrixXd>     fix_q_matrix  = std::nullopt,
-                              const init_emission_bundle*        init_emission = nullptr,
+                              const init_params_bundle*          init_params   = nullptr,
                               bool                               verbose       = false,
                               double                             reg_covar     = 1e-6,
                               double                             q_floor       = 0.0) {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
-    stm.use_pade_expm        = g_use_pade_expm;
     gmm_observation_model obs;
     obs.d = d;
     obs.diagonal_covariance = diagonal_covariance;
@@ -1460,38 +1480,21 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
     // CLI fix_pi=1 is the legacy spelling for --pi_mode free. We map that to
     // stationary_pi=false so EM updates pi from root posteriors instead of
     // deriving it from Q. Without a JSON pi, the free-pi path starts at 1/k.
-    // Default (fix_pi=0) uses stationary_pi=true, so pi tracks the stationary
-    // distribution of Q.
+    // The default (fix_pi=1 / --pi_mode free) therefore fits pi. Passing the
+    // deprecated fix_pi=0 spelling selects the stationary-Q mode instead.
     problem.stationary_pi = !fix_pi;
     problem.q_init_rate_  = q_init_rate;
 
-    if (init_emission) {
-        // --init_params_json / --init_emission_json: skip kmeans++/random
-        // init. Install (μ, Σ) from JSON; install Q from JSON if present,
-        // otherwise build the standard uniform-exit-rate Q from q_init_rate;
-        // install π from JSON if present, otherwise uniform. The same EM
-        // machinery (compute_suff_stats / m_step / set_params) runs on top of
-        // this init unchanged. In stationary pi mode, apply_state_and_rebuild_
-        // will derive pi from Q; use --pi_mode free to use a supplied pi as a
-        // true starting point.
-        obs.d     = d;
-        obs.mu    = init_emission->mu;
-        obs.Sigma = init_emission->Sigma;
-        if (init_emission->Q) {
-            stm.Q = *init_emission->Q;
-        } else {
-            problem.q_init_rate_ = q_init_rate;
-            problem.initialize_q_from_rate_();
-        }
-        if (init_emission->pi) {
-            std::vector<double> pi_v(k);
-            for (std::size_t i = 0; i < k; ++i)
-                pi_v[i] = (*init_emission->pi)[static_cast<Eigen::Index>(i)];
-            stm.root_prior = { pi_v };
-        } else {
-            stm.root_prior = { std::vector<double>(k, 1.0 / static_cast<double>(k)) };
-        }
-        problem.apply_state_and_rebuild_();
+    // Establish the normal initialization for every field that the JSON does
+    // not provide. If both emission fields are supplied, preserve the old
+    // complete-JSON path: no data-driven emission seeding is needed (which
+    // also keeps a complete JSON usable when K > number of observations).
+    const bool json_has_complete_emission =
+        init_params && init_params->mu && init_params->Sigma;
+    if (json_has_complete_emission) {
+        problem.initialize_q_from_rate_();
+        stm.root_prior = {
+            std::vector<double>(k, 1.0 / static_cast<double>(k))};
     } else if (use_kmeans_pp) {
         problem.initialize_kmeans_pp(static_cast<uint64_t>(seed),
                                      kmeans_standard,
@@ -1499,6 +1502,23 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
                                      kmeans_tol);
     } else {
         problem.initialize_random(static_cast<uint64_t>(seed));
+    }
+
+    if (init_params) {
+        // Overlay only the fields present in --init_params_json. Missing
+        // fields keep the baseline established above. A supplied pi is a true
+        // starting value only in free-pi mode; stationary mode deliberately
+        // derives pi from the (possibly overlaid) Q during the rebuild.
+        if (init_params->Q)     stm.Q     = *init_params->Q;
+        if (init_params->mu)    obs.mu    = *init_params->mu;
+        if (init_params->Sigma) obs.Sigma = *init_params->Sigma;
+        if (init_params->pi) {
+            std::vector<double> pi_v(k);
+            for (std::size_t i = 0; i < k; ++i)
+                pi_v[i] = (*init_params->pi)[static_cast<Eigen::Index>(i)];
+            stm.root_prior = { pi_v };
+        }
+        problem.apply_state_and_rebuild_();
     }
 
     // --fix_q / --fix_q_json: clobber Q with the given matrix and pin it. In
@@ -1525,15 +1545,18 @@ restart_record run_em_restart(std::vector<tree*>&               trees,
         problem.apply_state_and_rebuild_();
     }
 
-    if (fix_pi && !(init_emission && init_emission->pi)) {
+    if (fix_pi && !(init_params && init_params->pi)) {
         std::vector<double> uniform_pi(k, 1.0 / static_cast<double>(k));
         stm.root_prior = { uniform_pi };
     }
 
-    // --fix_emission, --fix_labels: μ, Σ frozen at kmeans++ init. Hard-label
+    // Freeze flags apply after normal initialization and any JSON overlay.
+    // --fix_covariance retains only Σ while allowing μ to update;
+    // --fix_emission and --fix_labels retain both μ and Σ. Hard-label
     // clamping itself lives in metadata.hard_labels (populated by the caller)
     // and takes effect inside compute_inside_log_likelihood.
-    if (fix_emission) problem.fix_emission = true;
+    problem.fix_emission   = fix_emission;
+    problem.fix_covariance = fix_covariance;
 
     Eigen::VectorXd initial_pi_rec(static_cast<Eigen::Index>(k));
     for (std::size_t i = 0; i < k; ++i)
@@ -1715,7 +1738,6 @@ posterior_outputs compute_posteriors(
 {
     ctmc_model stm;
     stm.complete_data_weight = ctmc_weight;
-    stm.use_pade_expm        = g_use_pade_expm;
     stm.Q = best.Q;
     // Pre-install π as root_prior so ctmc_model::build() doesn't overwrite it
     // with uniform (its empty-or-wrong-size fallback).
@@ -1851,7 +1873,6 @@ struct cli_args {
     int         n_init       = 10;
     bool        verbose      = false;
     bool        van_loan     = false;  // --van_loan: expm suff-stats instead of Hobolth-Jensen
-    bool        pade_expm    = false;  // --pade_expm: scaling-and-squaring exp(tQ) in the likelihood
     double      ctmc_weight  = 1.0;
     double      emission_weight = 1.0;
     bool        kmeans_standard = false;
@@ -1870,9 +1891,11 @@ struct cli_args {
     int         restart_threads     = 0;  // 0 means hardware_concurrency
 
     // Mode selectors. At most one of {fix_q_rate/fix_q_json, fix_labels_csv,
-    // bayes_opt} may be set. --fix_emission may be combined with --fix_q
-    // (fix both), and is implicit under --fix_labels and --bayes_opt.
+    // bayes_opt} may be set. --fix_emission and --fix_covariance may be
+    // combined with --fix_q. Full emission freezing is implicit under
+    // --fix_labels and --bayes_opt.
     bool                       fix_emission     = false;
+    bool                       fix_covariance   = false;
     std::optional<double>      fix_q_rate;             // --fix_q <rate>
     std::optional<std::string> fix_q_json;             // --fix_q_json <path>
     std::optional<std::string> fix_labels_csv;         // --fix_labels <csv>
@@ -1897,7 +1920,7 @@ void print_usage(const char* prog) {
       "                [--kmeans_init seeding|standard] \\\n"
       "                [--init_params_json params.json] \\\n"
       "                --tree T1 --obs O1 [--tree T2 --obs O2 ...] \\\n"
-      "                [mode flag]\n"
+      "                [mode / freeze flags]\n"
       "\n"
       "K-means++ initialization (default 'seeding'):\n"
       "  --kmeans_init seeding   choose k-means++ centers only; no Lloyd steps\n"
@@ -1917,7 +1940,8 @@ void print_usage(const char* prog) {
       "  --reg_covar R           ridge added to every Sigma_i diagonal each M-step\n"
       "                          (default 1e-6). Raise it if components collapse\n"
       "                          onto near-singleton clusters. Same role as\n"
-      "                          sklearn GaussianMixture's reg_covar.\n"
+      "                          sklearn GaussianMixture's reg_covar. It does not\n"
+      "                          modify a covariance held by a freeze flag.\n"
       "  --warn_degenerate W D C  post-fit warnings on the best solution: flag any\n"
       "                          component with occupancy fraction < W, dwell\n"
       "                          fraction < D, or min-eigenvalue(Sigma_i) < C.\n"
@@ -1929,12 +1953,6 @@ void print_usage(const char* prog) {
       "\n"
       "Diagnostics:\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
-      "  --pade_expm             Compute exp(t*Q) for branch transition probabilities\n"
-      "                          by scaling-and-squaring (Pade) instead of from the\n"
-      "                          cached eigendecomposition. Slower, but the only\n"
-      "                          correct choice when Q is reducible: the eigen route\n"
-      "                          rebuilds structural zeros by cancellation, making the\n"
-      "                          likelihood depend on how states are numbered.\n"
       "  --van_loan              Compute CTMC E-step sufficient statistics via the\n"
       "                          Van Loan block-expm identity instead of the default\n"
       "                          Hobolth-Jensen eigendecomposition. Slower but robust\n"
@@ -1946,6 +1964,8 @@ void print_usage(const char* prog) {
       "  --pi_mode free          pi initialized uniformly, then freely fit each\n"
       "                          M-step from the root posteriors.\n"
       "  --fix_pi 0|1            DEPRECATED alias. 0==stationary, 1==free.\n"
+      "  The Newick root branch suffix is ignored: pi is the distribution at\n"
+      "  the topological root, and phyloGMM has no incoming root stem.\n"
       "\n"
       "Weighted complete-data objective (defaults both to 1):\n"
       "  --ctmc_weight W_C       weight on the complete CTMC path term\n"
@@ -1956,14 +1976,17 @@ void print_usage(const char* prog) {
       "                          is the generalized (unnormalized) marginal\n"
       "                          log-objective, used for convergence/restarts.\n"
       "\n"
-      "Mode flags (at most one of the first three, plus optional --fix_emission):\n"
-      "  --fix_q <rate>          Q held at uniform-exit-rate matrix; EM on μ, Σ, π\n"
+      "Mode flags (at most one primary mode; freeze flags may be combined):\n"
+      "  --fix_q <rate>          Q held at uniform-exit-rate matrix; EM on μ, Σ, free π\n"
       "  --fix_q_json <path>     Q held at the K×K matrix read from JSON (key \"Q\");\n"
-      "                          EM on μ, Σ, π. Alternative to --fix_q for arbitrary\n"
+      "                          EM on μ, Σ, free π. Alternative to --fix_q for arbitrary\n"
       "                          (asymmetric / absorbing) Q matrices.\n"
-      "  --fix_emission          μ, Σ held at kmeans++ init; EM on Q (and π)\n"
+      "  --fix_emission          μ, Σ held at their initialized values; EM on Q and free π\n"
+      "  --fix_covariance        Σ held at its initialized value; EM still updates\n"
+      "                          μ, Q, and free π. With --init_params_json, the\n"
+      "                          supplied Sigma/sigma_diag is the fixed value.\n"
       "  --fix_labels <csv>      Leaf state assignments clamped to CSV labels;\n"
-      "                          EM on Q only. CSV header: cell,state (0-indexed).\n"
+      "                          EM on Q and free π. CSV header: cell,state (0-indexed).\n"
       "                          Implies --fix_emission.\n"
       "  --bayes_opt --true_q_exit_rate <r> --true_simplex_scale <s>\n"
       "                          No EM. True (Q, μ, Σ, π) constructed from flags;\n"
@@ -1978,16 +2001,17 @@ void print_usage(const char* prog) {
       "\n"
       "Init override (combinable with EM modes, not with --bayes_opt / --fix_labels):\n"
       "  --init_params_json <path>\n"
-      "                          Use user-defined (μ, Σ) — and optionally (Q, π) —\n"
-      "                          as the EM starting point instead of kmeans++/random\n"
-      "                          init. Q defaults to uniform-exit-rate from\n"
-      "                          --q_init_rate if absent; π defaults to 1/k. In\n"
+      "                          Overlay any non-empty subset of Q, μ, Σ, and π\n"
+      "                          onto the normal EM starting point. Missing μ/Σ\n"
+      "                          retain that restart's kmeans++/random values; Q\n"
+      "                          defaults from --q_init_rate and π defaults to 1/k. In\n"
       "                          --pi_mode stationary, π is derived from Q; use\n"
       "                          --pi_mode free to honor a JSON π as the start.\n"
       "                          EM then proceeds normally (updates Q, μ, Σ, π — or\n"
       "                          whatever isn't frozen by --fix_q / --fix_q_json /\n"
-      "                          --fix_emission). With --n_init > 1, every restart\n"
-      "                          uses the same JSON init (deterministic).\n"
+      "                          --fix_emission / --fix_covariance). Supplied fields\n"
+      "                          are shared across restarts; missing emission fields\n"
+      "                          remain seed-specific.\n"
       "  --init_emission_json <path>\n"
       "                          Deprecated alias for --init_params_json. Retains\n"
       "                          compatibility with older files that provide\n"
@@ -2041,7 +2065,6 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--n_init")            a.n_init      = std::stoi(next());
             else if (s == "--verbose")           a.verbose          = true;
             else if (s == "--van_loan")          a.van_loan         = true;
-            else if (s == "--pade_expm")         a.pade_expm        = true;
             else if (s == "--kmeans_init") {
                 std::string m = next();
                 if      (m == "seeding")  a.kmeans_standard = false;
@@ -2052,6 +2075,7 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             else if (s == "--kmeans_max_iter")   a.kmeans_max_iter = std::stoi(next());
             else if (s == "--kmeans_tol")        a.kmeans_tol      = std::stod(next());
             else if (s == "--fix_emission")      a.fix_emission     = true;
+            else if (s == "--fix_covariance")    a.fix_covariance   = true;
             else if (s == "--diag_covariance" ||
                      s == "--diagonal_covariance") {
                 a.diagonal_covariance = true;
@@ -2134,9 +2158,9 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
         // --init_params_json: incompatible with --bayes_opt (which doesn't run
         // EM) and --fix_labels (which clamps μ, Σ from kmeans++ init —
         // semantically incompatible with reading them from JSON). Compatible
-        // with --fix_q, --fix_q_json, and --fix_emission: in those cases the
-        // JSON simply provides the initial values that are then either frozen
-        // or updated by EM, depending on the freeze flags.
+        // with --fix_q, --fix_q_json, --fix_emission, and --fix_covariance: in
+        // those cases the JSON simply provides initial values that are then
+        // either frozen or updated by EM, depending on the freeze flags.
         const bool has_init_json =
             a.init_params_json.has_value() || a.init_emission_json.has_value();
         if (a.init_params_json && a.init_emission_json)
@@ -2259,8 +2283,7 @@ int main_impl(int argc, char* argv[]) {
         return 1;
     }
 
-    g_use_van_loan   = A.van_loan;
-    g_use_pade_expm  = A.pade_expm;
+    g_use_van_loan = A.van_loan;
 
     const std::size_t k           = A.k;
     const int         max_iter    = A.max_iter;
@@ -2348,6 +2371,11 @@ int main_impl(int argc, char* argv[]) {
             std::cerr << "no trees parsed from " << tf << "\n";
             return 2;
         }
+        // In phyloGMM, pi is P(Z_root) at the topological root. There is no
+        // virtual ancestor or incoming root stem. The shared Newick parser
+        // retains a root-length slot for models such as LAML, so normalize
+        // that slot only at this executable boundary.
+        parsed[0].branch_lengths.at(parsed[0].root_id) = 0.0;
         tree_storage.push_back(std::move(parsed[0]));
     }
     std::vector<tree*> trees(n_trees);
@@ -2462,8 +2490,9 @@ int main_impl(int argc, char* argv[]) {
     //     straight to compute_posteriors. records remains empty so the
     //     "per_restart" JSON array is [].
     //   * Everything else: run the standard restart-EM loop, propagating
-    //     fix_q_rate / fix_emission into each run_em_restart call. --fix_labels
-    //     additionally clamps leaf inside likelihoods via metadata.hard_labels.
+    //     fix_q_rate / fix_emission / fix_covariance into each run_em_restart
+    //     call. --fix_labels additionally clamps leaf inside likelihoods via
+    //     metadata.hard_labels.
 
     std::vector<restart_record> records;
     restart_record              best_storage;  // only used by --bayes_opt
@@ -2529,37 +2558,34 @@ int main_impl(int argc, char* argv[]) {
             validate_ctmc_q(*fix_q_mat, "--fix_q_json");
         }
 
-        // --init_params_json / --init_emission_json: load once, share across
-        // all restarts. mu and covariance are required; Q and pi are optional
-        // (when absent, run_em_restart falls back to uniform-exit-rate Q and
-        // uniform π respectively). With --n_init > 1, every restart uses the
-        // same JSON init.
+        // --init_params_json / --init_emission_json: load one non-empty subset
+        // of Q, mu, covariance, and pi, then share that overlay across all
+        // restarts. Each absent field retains its normal per-restart value.
         const std::optional<std::string> init_json_path =
             A.init_params_json ? A.init_params_json : A.init_emission_json;
         const bool init_json_is_legacy_alias =
             A.init_emission_json.has_value();
-        std::optional<init_emission_bundle> init_bundle;
+        std::optional<init_params_bundle> init_bundle;
         if (init_json_path) {
             std::cerr << (A.init_params_json
                               ? "init_params_json = "
                               : "init_emission_json = ")
                       << *init_json_path << "\n";
             const truth_json tj = load_truth_json(*init_json_path);
-            if (tj.mu.empty())
+            if (!tj.has_any_parameter())
                 throw std::runtime_error(
-                    "--init_params_json: required key 'mu' missing or empty");
-            if (tj.Sigma.empty() && tj.sigma_diag.empty())
-                throw std::runtime_error(
-                    "--init_params_json: required key 'Sigma' or 'sigma_diag' "
-                    "missing or empty");
-            init_emission_bundle b;
-            b.mu = vec2d_to_vector_list(tj.mu, k, d, "mu");
-            b.Sigma = sigma_from_json(
-                tj, k, d, A.diagonal_covariance,
-                init_json_is_legacy_alias ? 1e-6 : 0.0,
-                A.init_params_json ? "--init_params_json"
-                                   : "--init_emission_json");
-            if (!tj.Q.empty()) {
+                    "--init_params_json: expected at least one of 'Q', 'mu', "
+                    "'Sigma', 'sigma_diag', or 'pi'");
+            init_params_bundle b;
+            if (tj.has_mu)
+                b.mu = vec2d_to_vector_list(tj.mu, k, d, "mu");
+            if (tj.has_Sigma || tj.has_sigma_diag)
+                b.Sigma = sigma_from_json(
+                    tj, k, d, A.diagonal_covariance,
+                    init_json_is_legacy_alias ? 1e-6 : 0.0,
+                    A.init_params_json ? "--init_params_json"
+                                       : "--init_emission_json");
+            if (tj.has_Q) {
                 b.Q = vec2d_to_matrix(tj.Q, k, k, "Q");
                 validate_ctmc_q(*b.Q,
                                 A.init_params_json ? "--init_params_json"
@@ -2572,7 +2598,7 @@ int main_impl(int argc, char* argv[]) {
             }
             init_bundle = std::move(b);
         }
-        const init_emission_bundle* init_ptr =
+        const init_params_bundle* init_ptr =
             init_bundle ? &(*init_bundle) : nullptr;
 
         std::vector<restart_job> jobs;
@@ -2604,6 +2630,7 @@ int main_impl(int argc, char* argv[]) {
                                   A.fix_q_rate,
                                   A.fix_emission
                                      || A.fix_labels_csv.has_value(),
+                                  A.fix_covariance,
                                   A.diagonal_covariance,
                                   fix_q_mat,
                                   init_ptr,
@@ -2818,6 +2845,9 @@ int main_impl(int argc, char* argv[]) {
         }
         if (A.fix_emission || A.fix_labels_csv || A.bayes_opt) {
             sep(); std::cout << "\"fix_emission\": true";
+        }
+        if (A.fix_covariance) {
+            sep(); std::cout << "\"fix_covariance\": true";
         }
         if (A.fix_labels_csv) {
             sep();
