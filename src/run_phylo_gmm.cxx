@@ -2393,6 +2393,25 @@ int main_impl(int argc, char* argv[]) {
         // retains a root-length slot for models such as LAML, so normalize
         // that slot only at this executable boundary.
         parsed[0].branch_lengths.at(parsed[0].root_id) = 0.0;
+
+        // Zeroing that slot is not enough when the Newick root is unary, which
+        // is how the simulated forests are written: the root's own slot is the
+        // (nonexistent) edge ABOVE it, while the real edge root->MRCA lives in
+        // the child's slot and carries a median length of ~0.34. pi would then
+        // sit a full branch above the MRCA. Walk down the unary chain and zero
+        // each link instead. apply_log_transition() treats a zero-length edge
+        // as exactly P(0) = I, so this is equivalent to rooting at the MRCA
+        // while leaving root_id, the node ids, and the graph untouched -- no
+        // node is orphaned and every downstream loop over 0..num_nodes still
+        // sees the same structure.
+        {
+            auto& pt = parsed[0];
+            int node = static_cast<int>(pt.root_id);
+            while (pt.tree.successors(node).size() == 1) {
+                node = pt.tree.successors(node)[0];
+                pt.branch_lengths.at(static_cast<std::size_t>(node)) = 0.0;
+            }
+        }
         tree_storage.push_back(std::move(parsed[0]));
     }
     std::vector<tree*> trees(n_trees);
