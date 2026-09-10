@@ -272,6 +272,19 @@ add_executable(test_multi_tree_aggregation tests/phylo_gmm/test_multi_tree_aggre
 target_link_libraries(test_multi_tree_aggregation PRIVATE phylocore_core)
 add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 
+# ── phyloGMM CTMC permutation-invariance test ────────────────────────────────
+# Relabelling the latent states describes the identical model, so the likelihood
+# must not change. It did: exp(tQ) via eigendecomposition rebuilds the structural
+# zeros of a REDUCIBLE Q by cancellation, and the log-space guard then classifies
+# the +/-1e-15 residue as "possible" or "impossible" depending on state ordering.
+# Asserts ctmc_model::use_pade_expm restores invariance. NOTE: the fixture must
+# stay reducible -- a dense random Q passes even on the buggy path.
+add_executable(test_ctmc_permutation_invariance
+    tests/phylo_gmm/test_ctmc_permutation_invariance.cxx)
+target_link_libraries(test_ctmc_permutation_invariance PRIVATE phylocore_core)
+add_test(NAME test_ctmc_permutation_invariance
+         COMMAND test_ctmc_permutation_invariance)
+
 # ── MeLT likelihood tests ────────────────────────────────────────────────────
 # NOTE: tests/melt/test_melt_ctmc.cxx is referenced by Akhil's upstream commit
 # 5c1af7d but the source file was never committed. Local workaround: skip the
