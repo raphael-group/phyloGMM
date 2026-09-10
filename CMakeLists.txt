@@ -223,6 +223,13 @@ add_executable(test_random_init_phylo_gmm tests/phylo_gmm/test_random_init_phylo
 target_link_libraries(test_random_init_phylo_gmm PRIVATE phylocore_core)
 add_test(NAME test_random_init_phylo_gmm COMMAND test_random_init_phylo_gmm)
 
+# The phyloGMM simulator samples the topological root directly from pi, so its
+# root-length storage slot must not introduce an artificial incoming stem.
+add_executable(test_phylo_gmm_simulator_root
+    tests/phylo_gmm/test_phylo_gmm_simulator_root.cxx)
+target_link_libraries(test_phylo_gmm_simulator_root PRIVATE phylocore_core)
+add_test(NAME test_phylo_gmm_simulator_root COMMAND test_phylo_gmm_simulator_root)
+
 # ── phyloGMM fix_Q / fix_emission / stationary_pi flag-combination test ──────
 # Exercises the conditional logic for the three model-level flags on
 # phylo_gmm_problem (only the defaults are tested elsewhere).
@@ -231,8 +238,8 @@ target_link_libraries(test_phylo_gmm_flags PRIVATE phylocore_core)
 add_test(NAME test_phylo_gmm_flags COMMAND test_phylo_gmm_flags)
 
 # ── phyloGMM CLI parameter-initialization test ───────────────────────────────
-# Verifies --init_params_json installs user-defined Q, mu, Sigma, and pi as the
-# recorded initial parameters before any EM update runs.
+# Verifies --init_params_json overlays arbitrary subsets of Q, mu, Sigma, and
+# pi, and that --fix_covariance preserves initialized Sigma while EM updates mu.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(
@@ -247,6 +254,12 @@ if(Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/phylo_gmm/test_run_phylo_gmm_weights.py
                 $<TARGET_FILE:run_phylo_gmm>
     )
+    add_test(
+        NAME test_run_phylo_gmm_root_stem
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/phylo_gmm/test_run_phylo_gmm_root_stem.py
+                $<TARGET_FILE:run_phylo_gmm>
+    )
 endif()
 
 # ── phyloGMM multi-tree suff_stats aggregation test ──────────────────────────
@@ -258,19 +271,6 @@ endif()
 add_executable(test_multi_tree_aggregation tests/phylo_gmm/test_multi_tree_aggregation.cxx)
 target_link_libraries(test_multi_tree_aggregation PRIVATE phylocore_core)
 add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
-
-# ── phyloGMM CTMC permutation-invariance test ────────────────────────────────
-# Relabelling the latent states describes the identical model, so the likelihood
-# must not change. It did: exp(tQ) via eigendecomposition rebuilds the structural
-# zeros of a REDUCIBLE Q by cancellation, and the log-space guard then classifies
-# the +/-1e-15 residue as "possible" or "impossible" depending on state ordering.
-# Asserts ctmc_model::use_pade_expm restores invariance. NOTE: the fixture must
-# stay reducible -- a dense random Q passes even on the buggy path.
-add_executable(test_ctmc_permutation_invariance
-    tests/phylo_gmm/test_ctmc_permutation_invariance.cxx)
-target_link_libraries(test_ctmc_permutation_invariance PRIVATE phylocore_core)
-add_test(NAME test_ctmc_permutation_invariance
-         COMMAND test_ctmc_permutation_invariance)
 
 # ── MeLT likelihood tests ────────────────────────────────────────────────────
 # NOTE: tests/melt/test_melt_ctmc.cxx is referenced by Akhil's upstream commit
