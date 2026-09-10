@@ -1,6 +1,7 @@
 #ifndef PHYLOCORE_PHYLOGENY_H
 #define PHYLOCORE_PHYLOGENY_H
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -79,12 +80,22 @@ inline void apply_log_transition(
     std::vector<double>& log_terms,
     bool transpose)
 {
+    const size_t k =
+        state_transition_model.sites_latent_states[site].alphabet_size;
+
+    // P(0) is exactly the identity. Besides avoiding unnecessary work, this
+    // prevents an eigendecomposition-backed model from turning U * U^-1 into
+    // a merely approximate identity on zero-length edges.
+    if (branch_length == 0.0) {
+        std::copy_n(log_v.begin(), k, result.begin());
+        return;
+    }
+
     if (state_transition_model.has_optimized_functions) {
         state_transition_model.compute_log_pmatrix_vector_product(
             data, site, branch_length, log_v, result, transpose);
         return;
     }
-    size_t k = state_transition_model.sites_latent_states[site].alphabet_size;
     for (size_t i = 0; i < k; ++i) {
         for (size_t j = 0; j < k; ++j) {
             size_t a = transpose ? j : i;
