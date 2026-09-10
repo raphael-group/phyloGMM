@@ -170,9 +170,9 @@ inline phylocore::tree simulate_random_binary_tree(size_t num_leaves,
     }
 
     const size_t root_id = static_cast<size_t>(active[0]);
-    // By convention root edge length is filled (likelihood code treats it
-    // uniformly with other edges; we set to 1.0 to match io.cxx).
-    branch_lengths[root_id] = 1.0;
+    // phyloGMM draws the topological root directly from pi; it has no incoming
+    // root stem. Keep the otherwise edge-indexed length slot at exactly zero.
+    branch_lengths[root_id] = 0.0;
 
     phylocore::tree t{num_leaves, num_nodes, root_id, std::move(g),
                       std::move(branch_lengths), std::move(node_names)};
