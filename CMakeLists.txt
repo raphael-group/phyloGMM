@@ -277,8 +277,9 @@ add_test(NAME test_multi_tree_aggregation COMMAND test_multi_tree_aggregation)
 # must not change. It did: exp(tQ) via eigendecomposition rebuilds the structural
 # zeros of a REDUCIBLE Q by cancellation, and the log-space guard then classifies
 # the +/-1e-15 residue as "possible" or "impossible" depending on state ordering.
-# Asserts ctmc_model::use_pade_expm restores invariance. NOTE: the fixture must
-# stay reducible -- a dense random Q passes even on the buggy path.
+# Asserts ctmc_model::use_pade_expm's robust exponential backend restores
+# invariance. NOTE: the fixture must stay reducible -- a dense random Q passes
+# even on the buggy path.
 add_executable(test_ctmc_permutation_invariance
     tests/phylo_gmm/test_ctmc_permutation_invariance.cxx)
 target_link_libraries(test_ctmc_permutation_invariance PRIVATE phylocore_core)

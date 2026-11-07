@@ -9,6 +9,7 @@
 //   --fix_covariance EM on Q, μ, and free π; Σ stays at its init value
 //   --fix_labels <csv>  EM on Q and free π; leaf state assignments clamped to the
 //                       CSV. Implies --fix_emission (μ, Σ also frozen).
+//                       Compatible with --init_params_json; Q remains learnable.
 //                       Labels CSV: "cell,state" header; state is 0-indexed.
 //   --bayes_opt      No EM. True (Q, μ, Σ, π) are constructed from
 //                    --true_q_exit_rate <r> and --true_simplex_scale <s>:
@@ -514,9 +515,9 @@ constexpr double expected_transition_tol = 1e-10;
 bool g_use_van_loan = false;
 
 // Set once from --pade_expm in main_impl (before any restart threads spawn).
-// When true, ctmc_model computes exp(t*Q) by scaling-and-squaring instead of
-// from its cached eigendecomposition. See ctmc.h for why this matters on a
-// reducible Q.
+// When true, ctmc_model computes exp(t*Q) through its robust exponential
+// backend instead of the cached eigendecomposition. See ctmc.h for why this
+// matters on a reducible Q.
 bool g_use_pade_expm = false;
 
 class phylo_gmm_problem
@@ -1881,7 +1882,7 @@ struct cli_args {
     int         n_init       = 10;
     bool        verbose      = false;
     bool        van_loan     = false;  // --van_loan: expm suff-stats instead of Hobolth-Jensen
-    bool        pade_expm    = false;  // --pade_expm: scaling-and-squaring exp(tQ) in the likelihood
+    bool        pade_expm    = false;  // --pade_expm: robust exp(tQ) in the likelihood
     double      ctmc_weight  = 1.0;
     double      emission_weight = 1.0;
     bool        kmeans_standard = false;
@@ -1963,11 +1964,11 @@ void print_usage(const char* prog) {
       "Diagnostics:\n"
       "  --verbose               Emit per-iteration EM log-likelihood trace to stderr.\n"
       "  --pade_expm             Compute exp(t*Q) for branch transition probabilities\n"
-      "                          by scaling-and-squaring (Pade) instead of from the\n"
-      "                          cached eigendecomposition. Slower, but the only\n"
-      "                          correct choice when Q is reducible: the eigen route\n"
-      "                          rebuilds structural zeros by cancellation, making the\n"
-      "                          likelihood depend on how states are numbered.\n"
+      "                          with the robust exponential backend instead of the\n"
+      "                          cached eigendecomposition. For a reducible weight-1\n"
+      "                          CTMC this uses non-negative uniformization plus a\n"
+      "                          reachability mask; this prevents roundoff from making\n"
+      "                          the likelihood depend on how states are numbered.\n"
       "  --van_loan              Compute CTMC E-step sufficient statistics via the\n"
       "                          Van Loan block-expm identity instead of the default\n"
       "                          Hobolth-Jensen eigendecomposition. Slower but robust\n"
@@ -2014,7 +2015,7 @@ void print_usage(const char* prog) {
       "                          absent. Replaces --true_q_exit_rate and\n"
       "                          --true_simplex_scale for arbitrary K, d, and μ.\n"
       "\n"
-      "Init override (combinable with EM modes, not with --bayes_opt / --fix_labels):\n"
+      "Init override (combinable with EM modes, not with --bayes_opt):\n"
       "  --init_params_json <path>\n"
       "                          Overlay any non-empty subset of Q, μ, Σ, and π\n"
       "                          onto the normal EM starting point. Missing μ/Σ\n"
@@ -2027,6 +2028,9 @@ void print_usage(const char* prog) {
       "                          --fix_emission / --fix_covariance). Supplied fields\n"
       "                          are shared across restarts; missing emission fields\n"
       "                          remain seed-specific.\n"
+      "                          With --fix_labels, Q is still updated by EM; μ/Σ\n"
+      "                          are frozen after initialization and any JSON overlay.\n"
+      "                          A JSON containing only Q is sufficient.\n"
       "  --init_emission_json <path>\n"
       "                          Deprecated alias for --init_params_json. Retains\n"
       "                          compatibility with older files that provide\n"
@@ -2171,12 +2175,10 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
         if (n_modes > 1)
             throw std::runtime_error(
                 "--fix_q/--fix_q_json, --fix_labels, --bayes_opt are mutually exclusive");
-        // --init_params_json: incompatible with --bayes_opt (which doesn't run
-        // EM) and --fix_labels (which clamps μ, Σ from kmeans++ init —
-        // semantically incompatible with reading them from JSON). Compatible
-        // with --fix_q, --fix_q_json, --fix_emission, and --fix_covariance: in
-        // those cases the JSON simply provides initial values that are then
-        // either frozen or updated by EM, depending on the freeze flags.
+        // --init_params_json supplies starting values before freeze flags are
+        // applied, including under --fix_labels (Q and free π still update;
+        // μ and Σ are frozen after the overlay). Only --bayes_opt is
+        // incompatible because it doesn't run EM.
         const bool has_init_json =
             a.init_params_json.has_value() || a.init_emission_json.has_value();
         if (a.init_params_json && a.init_emission_json)
@@ -2189,9 +2191,6 @@ bool parse_cli(int argc, char* argv[], cli_args& a) {
             if (a.bayes_opt_truth_json)
                 throw std::runtime_error(
                     "--init_params_json is incompatible with --bayes_opt_truth_json");
-            if (a.fix_labels_csv)
-                throw std::runtime_error(
-                    "--init_params_json is incompatible with --fix_labels");
         }
         if (a.bayes_opt) {
             // --bayes_opt_truth_json supersedes --true_q_exit_rate / --true_simplex_scale.
@@ -2336,6 +2335,7 @@ int main_impl(int argc, char* argv[]) {
               << ", lloyd_tol = " << A.kmeans_tol << ")\n";
     std::cerr << "covariance = "
               << (A.diagonal_covariance ? "diagonal" : "full") << "\n";
+    std::cerr << "pade_expm = " << (A.pade_expm ? "true" : "false") << "\n";
     std::cerr << "parallel_restarts = "
               << (A.parallel_restarts ? "true" : "false");
     if (A.parallel_restarts) {
@@ -2872,6 +2872,9 @@ int main_impl(int argc, char* argv[]) {
         auto sep = [&]() { if (!first) std::cout << ", "; first = false; };
         sep(); std::cout << "\"ctmc_weight\": " << A.ctmc_weight;
         sep(); std::cout << "\"emission_weight\": " << A.emission_weight;
+        if (A.pade_expm) {
+            sep(); std::cout << "\"pade_expm\": true";
+        }
         if (A.fix_q_rate) {
             sep(); std::cout << "\"fix_q_rate\": " << *A.fix_q_rate;
         }

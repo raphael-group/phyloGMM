@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -98,6 +99,32 @@ void ctmc_model::build() {
         branch_operator = A;
     }
 
+    // Transitive closure of the positive off-diagonal graph. Matrix-exponential
+    // entries are structurally zero exactly when no directed path connects the
+    // corresponding states. Eigen's dense Pade/LU implementation is accurate,
+    // but an arbitrary state permutation can introduce signed O(epsilon) fill
+    // into such entries. Record the graph structure once per rebuild so the
+    // transition path can remove that fill deterministically.
+    transition_reachable.assign(k * k, 0);
+    for (size_t i = 0; i < k; ++i) {
+        transition_reachable[i * k + i] = 1;
+        for (size_t j = 0; j < k; ++j) {
+            if (i != j && Q(static_cast<Eigen::Index>(i),
+                            static_cast<Eigen::Index>(j)) > 0.0) {
+                transition_reachable[i * k + j] = 1;
+            }
+        }
+    }
+    for (size_t via = 0; via < k; ++via) {
+        for (size_t i = 0; i < k; ++i) {
+            if (!transition_reachable[i * k + via]) continue;
+            for (size_t j = 0; j < k; ++j) {
+                if (transition_reachable[via * k + j])
+                    transition_reachable[i * k + j] = 1;
+            }
+        }
+    }
+
     // Single shared site_space — the paper assumes one Q across the tree.
     sites_latent_states = {{ k, {}, 0 }};
 
@@ -120,16 +147,158 @@ void ctmc_model::build() {
     has_optimized_functions = true;
 }
 
-// ── Pade branch operator ──────────────────────────────────────────────────────
+// ── Robust branch operator ────────────────────────────────────────────────────
 //
-// exp(t * branch_operator) by scaling-and-squaring. Unlike the eigendecomposition
-// route this never forms a dense U / U^-1, so entries of exp(tQ) that are
-// structurally zero (state j unreachable from i) come out as exactly 0.0 rather
-// than +/-1e-15. That keeps the log-space guard below deterministic and makes
-// the likelihood invariant to how the states happen to be numbered.
+// For irreducible Q, exp(t * branch_operator) is evaluated by Eigen's Pade
+// scaling-and-squaring implementation. For a reducible weight-1 CTMC, use the
+// non-negative uniformization implementation below: even after structural-zero
+// masking, dense Pade arithmetic can round a genuinely reachable tiny value
+// negative on a long branch. Finally apply the reachability mask in either case.
 
-Eigen::MatrixXd ctmc_model::pade_transition(double t) const {
-    return (branch_operator * t).exp();
+Eigen::MatrixXd ctmc_model::robust_transition(double t) const {
+    const size_t k = static_cast<size_t>(branch_operator.rows());
+    assert(transition_reachable.size() == k * k);
+
+    bool reducible = false;
+    for (unsigned char reachable : transition_reachable) {
+        if (!reachable) {
+            reducible = true;
+            break;
+        }
+    }
+
+    bool uniformization_safe = complete_data_weight == 1.0
+                            && t >= 0.0
+                            && t <= std::numeric_limits<double>::max();
+    for (size_t i = 0; uniformization_safe && i < k; ++i) {
+        if (Q(static_cast<Eigen::Index>(i),
+              static_cast<Eigen::Index>(i)) > 0.0) {
+            uniformization_safe = false;
+        }
+        for (size_t j = 0; uniformization_safe && j < k; ++j) {
+            if (i != j && Q(static_cast<Eigen::Index>(i),
+                            static_cast<Eigen::Index>(j)) < 0.0) {
+                uniformization_safe = false;
+            }
+        }
+    }
+
+    Eigen::MatrixXd P = (reducible && uniformization_safe)
+                            ? uniformization_transition(t)
+                            : (branch_operator * t).exp();
+    if (complete_data_weight == 1.0) {
+        for (size_t i = 0; i < k; ++i) {
+            for (size_t j = 0; j < k; ++j) {
+                if (!transition_reachable[i * k + j]) {
+                    P(static_cast<Eigen::Index>(i),
+                      static_cast<Eigen::Index>(j)) = 0.0;
+                }
+            }
+        }
+    }
+    return P;
+}
+
+Eigen::MatrixXd ctmc_model::uniformization_transition(double t) const {
+    const Eigen::Index n = Q.rows();
+    const size_t k = static_cast<size_t>(n);
+    const Eigen::MatrixXd I = Eigen::MatrixXd::Identity(n, n);
+    if (t == 0.0) return I;
+
+    double nu = 0.0;
+    for (Eigen::Index i = 0; i < n; ++i)
+        nu = std::max(nu, -Q(i, i));
+    if (!(nu > 0.0)) return I;
+
+    // Scale until the Poisson mean of the base exponential is at most 1/2.
+    // This keeps the series short and starts it at exp(-mu), far from
+    // underflow. Squaring later restores the original branch length.
+    double scaled_t = t;
+    int squarings = 0;
+    constexpr int max_squarings = 4096;
+    while (nu * scaled_t > 0.5 && squarings < max_squarings) {
+        scaled_t *= 0.5;
+        ++squarings;
+    }
+    if (squarings == max_squarings)
+        return (Q * t).exp();
+    const double mu = nu * scaled_t;
+    const Eigen::MatrixXd R = I + Q / nu;
+
+    Eigen::MatrixXd power = I;
+    double weight = std::exp(-mu);
+    Eigen::MatrixXd P = weight * I;
+
+    // A shortest directed path has at most k-1 edges, so do not terminate the
+    // series before every representable reachable entry has had a chance to
+    // appear. With mu <= 1/2, subsequent Poisson weights decrease monotonically.
+    const size_t min_order = (k == 0) ? 0 : k - 1;
+    const size_t max_order = std::max<size_t>(min_order, 2048);
+    for (size_t order = 1; order <= max_order; ++order) {
+        power = (power * R).eval();
+        weight *= mu / static_cast<double>(order);
+        P.noalias() += weight * power;
+
+        if (weight == 0.0) break;
+        const double next_weight =
+            weight * mu / static_cast<double>(order + 1);
+        if (order >= min_order) {
+            // Since mu <= 1/2, the remaining Poisson weights are bounded by
+            // a geometric series whose first term is next_weight. Every entry
+            // of every power of the stochastic matrix R is at most one, so
+            // that scalar tail also bounds the omitted error in each entry.
+            const double next_ratio =
+                mu / static_cast<double>(order + 2);
+            const double tail_bound = next_weight / (1.0 - next_ratio);
+
+            // A global Poisson-tail test is not enough here: a transition that
+            // first appears at order k-1 can be tiny even while the matrix has
+            // O(1) entries. Require relative accuracy for the smallest
+            // reachable entry accumulated so far. If a reachable entry is
+            // still zero, keep going until it appears or the weights underflow.
+            double min_positive = std::numeric_limits<double>::max();
+            bool all_reachable_positive = true;
+            for (size_t i = 0; i < k; ++i) {
+                for (size_t j = 0; j < k; ++j) {
+                    if (!transition_reachable[i * k + j]) continue;
+                    const double value = P(static_cast<Eigen::Index>(i),
+                                           static_cast<Eigen::Index>(j));
+                    if (value > 0.0) {
+                        min_positive = std::min(min_positive, value);
+                    } else {
+                        all_reachable_positive = false;
+                    }
+                }
+            }
+            if (all_reachable_positive &&
+                tail_bound <= std::numeric_limits<double>::epsilon()
+                              * min_positive) {
+                break;
+            }
+        }
+    }
+
+    // A CTMC transition matrix is row-stochastic. Restore that exact invariant
+    // before and during squaring: otherwise an O(epsilon) row-sum error in the
+    // base series can be amplified by 2^s when Q contains widely separated
+    // rates and scaling requires many squarings. Row scaling preserves every
+    // structural zero because the series above is non-negative.
+    const auto normalize_rows = [](Eigen::MatrixXd& matrix) {
+        for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+            const double row_sum = matrix.row(row).sum();
+            if (!(row_sum > 0.0) || !std::isfinite(row_sum))
+                throw std::runtime_error(
+                    "ctmc_model::uniformization_transition: non-finite or "
+                    "non-positive transition row sum");
+            matrix.row(row) /= row_sum;
+        }
+    };
+    normalize_rows(P);
+    for (int i = 0; i < squarings; ++i) {
+        P = (P * P).eval();
+        normalize_rows(P);
+    }
+    return P;
 }
 
 // ── Scalar primitive ──────────────────────────────────────────────────────────
@@ -149,8 +318,8 @@ double ctmc_model::compute_log_transition_probability(
 ) const {
     if (use_pade_expm) {
         const double prob_p =
-            pade_transition(branch_length)(static_cast<Eigen::Index>(alpha),
-                                           static_cast<Eigen::Index>(beta));
+            robust_transition(branch_length)(static_cast<Eigen::Index>(alpha),
+                                             static_cast<Eigen::Index>(beta));
         return (prob_p > 0.0) ? std::log(prob_p) : NEGATIVE_INFINITY;
     }
 
@@ -194,7 +363,7 @@ void ctmc_model::compute_log_pmatrix_vector_product(
         Eigen::VectorXd vr(k);
         for (Eigen::Index i = 0; i < k; ++i)
             vr[i] = std::exp(log_vector[i] - max_log);
-        const Eigen::MatrixXd P = pade_transition(branch_length);
+        const Eigen::MatrixXd P = robust_transition(branch_length);
         Eigen::VectorXd rp = transpose ? (P.transpose() * vr).eval()
                                        : (P * vr).eval();
         for (Eigen::Index i = 0; i < k; ++i)

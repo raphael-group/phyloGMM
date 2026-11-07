@@ -27,8 +27,9 @@ namespace phylocore {
  * off-diagonals exactly zero) those zeros come back as +/-1e-15, and the
  * log-space guard then maps them inconsistently to log(tiny) vs -inf depending
  * on state ordering; when U is additionally ill-conditioned the whole matrix is
- * unreliable. Set use_pade_expm = true to compute exp(tQ) by scaling-and-
- * squaring (Pade) instead, which preserves the zero pattern exactly.
+ * unreliable. Set use_pade_expm = true to use the robust exponential backend:
+ * scaling-and-squaring (Pade) generally, and non-negative uniformization for a
+ * reducible weight-1 CTMC. A reachability mask preserves structural zeros.
  *
  * Uses the default D = std::monostate (no per-node state).
  *
@@ -44,8 +45,8 @@ namespace phylocore {
  *
  * Both the scalar primitive compute_log_transition_probability and the
  * optimized matvec compute_log_pmatrix_vector_product are overridden;
- * build() sets has_optimized_functions = true so the traversal uses the
- * O(k) matvec path instead of the O(k³) scalar fallback (matters at k >= 4).
+ * build() sets has_optimized_functions = true so the traversal makes one
+ * backend matrix-vector call instead of repeatedly invoking the scalar path.
  * EM hooks (e_step/m_step) are intentionally not overridden — parameter
  * estimation is a separate, future change.
  *
@@ -62,9 +63,12 @@ public:
     // kernel obtained by integrating [p_Q(path)]^w over branch paths.
     double complete_data_weight = 1.0;
 
-    // When true, exp(t * A) is computed by scaling-and-squaring (Pade) rather
-    // than from the cached eigendecomposition. Slower but numerically robust
-    // for reducible / ill-conditioned generators. The eigendecomposition is
+    // When true, exp(t * Q) uses the robust matrix-exponential path rather than
+    // the cached eigendecomposition. The primary backend is scaling-and-
+    // squaring (Pade). For a reducible, weight-1 CTMC it uses non-negative
+    // uniformization plus scaling-and-squaring, because dense Pade arithmetic
+    // can change the sign of tiny reachable probabilities. A graph-reachability
+    // mask then restores exact structural zeros. The eigendecomposition is
     // still built either way: hobolth_jensen_stats() consumes it.
     bool use_pade_expm = false;
 
@@ -78,7 +82,7 @@ public:
         size_t          beta
     ) const override;
 
-    // Optimised forward/transpose matvec via the cached eigendecomposition.
+    // Optimised forward/transpose matvec via the selected exponential backend.
     // result[i] = log Σ_j P(t)_{i,j} · exp(log_v[j])         (transpose=false)
     // result[i] = log Σ_j P(t)_{j,i} · exp(log_v[j])         (transpose=true)
     void compute_log_pmatrix_vector_product(
@@ -127,11 +131,23 @@ private:
     eigen_cache rate_cache;  // unweighted generator Q
 
     // Real branch operator matching `cache` (Q when complete_data_weight == 1,
-    // else the weighted path operator A). Used only by the Pade path.
+    // else the weighted path operator A). Used only by the robust path.
     Eigen::MatrixXd branch_operator;
 
-    // exp(t * branch_operator) via Eigen's scaling-and-squaring.
-    Eigen::MatrixXd pade_transition(double t) const;
+    // Row-major transitive closure of the directed positive-rate graph.
+    // transition_reachable[i*k+j] is true exactly when state j is reachable
+    // from state i (including i == j). It is rebuilt whenever Q is rebuilt and
+    // is used to restore structural zeros in the weight-1 robust path.
+    std::vector<unsigned char> transition_reachable;
+
+    // exp(t * branch_operator) via the selected robust backend. For weight 1,
+    // structurally impossible transitions are masked exactly.
+    Eigen::MatrixXd robust_transition(double t) const;
+
+    // Cancellation-free exp(tQ) for a weight-1 CTMC. The scaled base
+    // exponential is evaluated as a non-negative uniformization series and
+    // then repeatedly squared.
+    Eigen::MatrixXd uniformization_transition(double t) const;
 };
 
 } // namespace phylocore
