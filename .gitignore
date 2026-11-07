@@ -1,0 +1,6 @@
+build/
+build_*/
+examples/*/output/
+__pycache__/
+*.pyc
+.DS_Store
